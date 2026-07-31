@@ -311,9 +311,13 @@ def bench(model, config):
     from random import randint, seed
 
     seed(0)
+    # 从 --num-seqs=N 读条数，默认 4
     num_seqs = 4
-    max_input_len = 64
-    max_output_len = 128
+    for arg in sys.argv:
+        if arg.startswith("--num-seqs="):
+            num_seqs = int(arg.split("=")[1])
+    max_input_len = 16
+    max_output_len = 32
 
     print(f"\nBenchmark: {num_seqs} 条序列, input_len≤{max_input_len}, output_len≤{max_output_len}")
     print("预热中...")
