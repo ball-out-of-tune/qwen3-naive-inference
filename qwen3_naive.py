@@ -329,10 +329,13 @@ if __name__ == '__main__':
     params = sum(p.numel() for p in model.parameters())
     print(f"参数: {params:,}  |  VRAM: {vram:.2f} GB")
 
-    # 3. 输入 prompt
-    prompt_text = sys.argv[1] if len(sys.argv) > 1 else "今天天气真好"
-    # Qwen3-0.6B 对聊天模板+思考模式支持不好，纯文本续写反而更稳
-    prompt_ids = tokenizer.encode(prompt_text, return_tensors="pt").to('cuda')
+    # 3. 输入 prompt（使用聊天模板）
+    prompt_text = sys.argv[1] if len(sys.argv) > 1 else "你好，请介绍一下你自己"
+    messages = [{"role": "user", "content": prompt_text}]
+    formatted = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer.encode(formatted, return_tensors="pt").to('cuda')
     print(f"\nPrompt: {prompt_text}")
     print(f"Token IDs: {prompt_ids.tolist()[0][:8]}...  ({prompt_ids.shape[1]} tokens)")
 
