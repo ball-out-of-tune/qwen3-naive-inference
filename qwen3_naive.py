@@ -305,6 +305,53 @@ def _read_tensor(f, info, header_size, device):
         
 
 
+def bench(model, config):
+    """Benchmark: 随机 prompt，统计生成吞吐量"""
+    import time
+    from random import randint, seed
+
+    seed(0)
+    num_seqs = 4
+    max_input_len = 64
+    max_output_len = 128
+
+    print(f"\nBenchmark: {num_seqs} 条序列, input_len≤{max_input_len}, output_len≤{max_output_len}")
+    print("预热中...")
+
+    # 预热：跑一条短序列，触发 CUDA kernel 编译
+    warmup = torch.randint(0, config.vocab_size, (1, 4), device='cuda')
+    model.generate_naive(warmup, max_new_tokens=4, temperature=0.6, top_k=20)
+
+    # 生成随机 prompt
+    prompt_ids_list = [
+        torch.randint(0, config.vocab_size, (1, randint(8, max_input_len)), device='cuda')
+        for _ in range(num_seqs)
+    ]
+    output_lens = [randint(32, max_output_len) for _ in range(num_seqs)]
+
+    total_tokens = 0
+
+    torch.cuda.synchronize()
+    t = time.time()
+
+    for prompt_ids, out_len in zip(prompt_ids_list, output_lens):
+        output = model.generate_naive(
+            prompt_ids,
+            max_new_tokens=out_len,
+            temperature=0.6,
+            top_k=20,
+            eos_token_ids=None,   # benchmark 不提前停
+        )
+        total_tokens += output.shape[1] - prompt_ids.shape[1]  # 新生成的 token 数
+
+    torch.cuda.synchronize()
+    elapsed = time.time() - t
+
+    throughput = total_tokens / elapsed
+    print(f"生成: {total_tokens} tokens / {elapsed:.2f}s = {throughput:.2f} tok/s")
+    print(f"VRAM: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
+
 if __name__ == '__main__':
     # ===== 端到端推理测试 =====
     import sys
@@ -329,8 +376,13 @@ if __name__ == '__main__':
     params = sum(p.numel() for p in model.parameters())
     print(f"参数: {params:,}  |  VRAM: {vram:.2f} GB")
 
+    # --bench 模式：性能测试
+    if "--bench" in sys.argv:
+        bench(model, config)
+        sys.exit(0)
+
     # 3. 输入 prompt（使用聊天模板）
-    prompt_text = sys.argv[1] if len(sys.argv) > 1 else "你好，请介绍一下你自己"
+    prompt_text = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "你好，请介绍一下你自己"
     messages = [{"role": "user", "content": prompt_text}]
     formatted = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
