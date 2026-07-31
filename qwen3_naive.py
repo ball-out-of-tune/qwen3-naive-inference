@@ -340,12 +340,17 @@ if __name__ == '__main__':
     print(f"Token IDs: {prompt_ids.tolist()[0][:8]}...  ({prompt_ids.shape[1]} tokens)")
 
     # 4. 生成
+    use_topk = "--no-topk" not in sys.argv
+    top_k = 20 if use_topk else None
+    if not use_topk:
+        print("(top_k=None, 全词表采样)")
+
     print("\n生成中...")
     output_ids = model.generate_naive(
         prompt_ids,
         max_new_tokens=256,
         temperature=0.6,
-        top_k=20,
+        top_k=top_k,
         eos_token_ids=[config.eos_token_id, config.bos_token_id],  # Qwen3 用两个 EOS
     )
     print(f"生成完成: {output_ids.shape[1]} tokens total")
