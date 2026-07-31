@@ -51,8 +51,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x):
-        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return x / rms * self.weight
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        x_f32 = x_f32 * torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x_f32 * self.weight.float()).to(orig_dtype)
 
 
 class BadRMSNorm:
@@ -68,36 +70,33 @@ class BadRMSNorm:
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, max_position, rope_theta):
         super().__init__()
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        # 强制转为 bf16，因为 .float() 固定返回 float32
-        inv_freq = inv_freq.to(torch.bfloat16)
-        pos = torch.arange(0, max_position)
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
+        pos = torch.arange(0, max_position, dtype=torch.float)
         freqs = torch.outer(pos, inv_freq)
-        self.register_buffer("cos_table", freqs.cos())
-        self.register_buffer("sin_table", freqs.sin())
+        cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+        self.register_buffer("cos_sin_cache", cache)   # [max_pos, head_dim] (half cos, half sin)
 
     def forward(self, q, k, positions):
-        cos = self.cos_table[positions]
-        sin = self.sin_table[positions]
+        orig_dtype_q = q.dtype
+        orig_dtype_k = k.dtype
 
-        # q size: [batch_size, seq_len, head_num, head_dim]
-        q_shape = q.shape
-        k_shape = k.shape
-        q_reshaped = q.reshape(*q.shape[:-1], -1, 2)
-        # q0 : [batch_size, seq_len, head_num, head_dim // 2]
-        q0, q1 = q_reshaped[..., 0], q_reshaped[..., 1]
-        # 用于下面的乘法 
-        cos = cos.unsqueeze(0).unsqueeze(2)
+        # cos/sin: [seq_len, head_dim//2] each
+        cos_sin = self.cos_sin_cache[positions]            # [seq_len, head_dim]
+        cos, sin = cos_sin.chunk(2, dim=-1)                # each [seq_len, head_dim//2]
+        # 加 batch 和 heads 维度用于广播
+        cos = cos.unsqueeze(0).unsqueeze(2)                # [1, seq_len, 1, head_dim//2]
         sin = sin.unsqueeze(0).unsqueeze(2)
-        q_new0 = q0 * cos - q1 * sin
-        q_new1 = q0 * sin + q1 * cos
-        q = torch.stack([q_new0, q_new1], dim=-1).reshape(q_shape)
 
-        k_reshaped = k.reshape(*k.shape[:-1], -1, 2)
-        k0, k1 = k_reshaped[..., 0], k_reshaped[..., 1]
-        k_new0 = k0 * cos - k1 * sin
-        k_new1 = k0 * sin + k1 * cos
-        k = torch.stack([k_new0, k_new1], dim=-1).reshape(k_shape)
+        def rotate(x, x_orig_dtype):
+            x_f32 = x.float()
+            x_reshaped = x_f32.reshape(*x.shape[:-1], -1, 2)
+            x0, x1 = x_reshaped[..., 0], x_reshaped[..., 1]
+            x_new0 = x0 * cos - x1 * sin
+            x_new1 = x0 * sin + x1 * cos
+            return torch.stack([x_new0, x_new1], dim=-1).reshape(x.shape).to(x_orig_dtype)
+
+        q = rotate(q, orig_dtype_q)
+        k = rotate(k, orig_dtype_k)
         return q, k 
 
 class Qwen3Attention(nn.Module):
@@ -168,16 +167,15 @@ class Qwen3Attention(nn.Module):
         k, v = self._repeat_kv(k, v)
 
         # 7. Scaled dot-product attention（和 gpt.py 完全一样）
-        scores = (q @ k.transpose(-2, -1)) * self.scale   # [batch, 16, seq, seq]
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale   # [batch, 16, seq, seq]
 
         causal_mask = torch.triu(
             torch.ones(seq_len, seq_len, device=x.device), diagonal=1
         ).bool()
-        # 用 score 自己的 dtype 的 -inf，避免 bf16 和 float32 混用
-        neg_inf = torch.tensor(float('-inf'), dtype=scores.dtype, device=scores.device)
-        scores = scores.masked_fill(causal_mask, neg_inf)
-
-        attn_weights = torch.softmax(scores, dim=-1)        # [batch, 16, seq, seq]
+        # softmax 用 float32 计算（数值稳定性），结果转回原 dtype
+        neg_inf = torch.tensor(float('-inf'), dtype=attn_scores.dtype, device=attn_scores.device)
+        attn_scores = attn_scores.masked_fill(causal_mask, neg_inf)
+        attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(attn_scores.dtype)
         attn_output = attn_weights @ v                      # [batch, 16, seq, 128]
 
         # 7. 合并多头 → 输出投影
