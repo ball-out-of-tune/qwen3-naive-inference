@@ -89,11 +89,10 @@ class RotaryEmbedding(nn.Module):
 
         def rotate(x, x_orig_dtype):
             x_f32 = x.float()
-            x_reshaped = x_f32.reshape(*x.shape[:-1], -1, 2)
-            x0, x1 = x_reshaped[..., 0], x_reshaped[..., 1]
-            x_new0 = x0 * cos - x1 * sin
-            x_new1 = x0 * sin + x1 * cos
-            return torch.stack([x_new0, x_new1], dim=-1).reshape(x.shape).to(x_orig_dtype)
+            x1, x2 = x_f32.chunk(2, dim=-1)        # 前半/后半配对，和 HF 一致
+            x_new0 = x1 * cos - x2 * sin
+            x_new1 = x2 * cos + x1 * sin
+            return torch.cat([x_new0, x_new1], dim=-1).to(x_orig_dtype)
 
         q = rotate(q, orig_dtype_q)
         k = rotate(k, orig_dtype_k)
