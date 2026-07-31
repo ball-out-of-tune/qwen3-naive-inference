@@ -107,17 +107,16 @@ class Qwen3Attention(nn.Module):
         self.num_heads = config.num_attention_heads       # 16
         self.num_kv_heads = config.num_key_value_heads     # 8
         self.head_dim = config.head_dim                    # 128
+        self.hidden_size = config.hidden_size               # 1024
         self.q_size = self.num_heads * self.head_dim        # 2048
         self.kv_size = self.num_kv_heads * self.head_dim    # 1024
         self.scale = self.head_dim ** -0.5
 
-        # Q、K、V 由一个 Linear 同时产出（合并投影，推理更快）
-        self.qkv_proj = nn.Linear(
-            config.hidden_size,
-            self.q_size + self.kv_size * 2,    # 2048 + 1024 + 1024 = 4096
-            bias=config.attention_bias,         # Qwen3: False
-        )
-        self.o_proj = nn.Linear(self.q_size, config.hidden_size, bias=False)
+        # 分开的 Q、K、V 投影——和 checkpoint 名字对齐，不需要拼接
+        self.q_proj = nn.Linear(self.hidden_size, self.q_size, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=False)
 
         # QK-Norm：对 Q 和 K 做逐头归一化（Qwen3 没有 bias 所以有这个）
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -133,52 +132,50 @@ class Qwen3Attention(nn.Module):
     def _repeat_kv(self, k, v):
         """GQA：把 KV 从 num_kv_heads 复制到 num_heads"""
         n_repeat = self.num_heads // self.num_kv_heads   # 16 // 8 = 2
-        k = k.repeat_interleave(n_repeat, dim=1)          # [batch, 8, seq, 128] → [batch, 16, seq, 128]
+        k = k.repeat_interleave(n_repeat, dim=1)
         v = v.repeat_interleave(n_repeat, dim=1)
         return k, v
 
     def forward(self, x):
-        # x: [batch, seq_len, hidden_size]
         batch, seq_len, _ = x.shape
 
-        # 1. QKV 投影 + 拆分
-        qkv = self.qkv_proj(x)                           # [batch, seq, 4096]
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # 1. 分开投影 Q、K、V
+        q = self.q_proj(x)    # [batch, seq, 2048]
+        k = self.k_proj(x)    # [batch, seq, 1024]
+        v = self.v_proj(x)    # [batch, seq, 1024]
 
-        # 2. 整理形状 → [batch, seq_len, num_heads, head_dim]（先不 transpose）
+        # 2. view → [batch, seq_len, num_heads, head_dim]
         q = q.view(batch, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim)
 
-        # 3. QK-Norm（对最后一维做，和 RMSNorm 一致）
+        # 3. QK-Norm
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # 4. RoPE（也按 [batch, seq_len, heads, dim] 格式，和 cos/sin 的 unsqueeze 匹配）
+        # 4. RoPE
         positions = torch.arange(0, seq_len, device=x.device)
         q, k = self.rotary_emb(q, k, positions)
 
-        # 5. transpose → [batch, num_heads, seq_len, head_dim]（attention 计算需要这个格式）
+        # 5. transpose → [batch, heads, seq, dim]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # 6. GQA：复制 KV
+        # 6. GQA: repeat KV
         k, v = self._repeat_kv(k, v)
 
-        # 7. Scaled dot-product attention（和 gpt.py 完全一样）
-        attn_scores = (q @ k.transpose(-2, -1)) * self.scale   # [batch, 16, seq, seq]
-
+        # 7. Scaled dot-product attention
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
         causal_mask = torch.triu(
             torch.ones(seq_len, seq_len, device=x.device), diagonal=1
         ).bool()
-        # softmax 用 float32 计算（数值稳定性），结果转回原 dtype
         neg_inf = torch.tensor(float('-inf'), dtype=attn_scores.dtype, device=attn_scores.device)
         attn_scores = attn_scores.masked_fill(causal_mask, neg_inf)
         attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(attn_scores.dtype)
-        attn_output = attn_weights @ v                      # [batch, 16, seq, 128]
+        attn_output = attn_weights @ v
 
-        # 7. 合并多头 → 输出投影
+        # 8. merge heads → output projection
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(attn_output)
 
@@ -188,24 +185,13 @@ class Qwen3MLP(nn.Module):
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
-        # 两条并行路径，合并成一个 Linear 输出（和 qkv 合并一样，省一次 kernel launch）
-        self.gate_up_proj = nn.Linear(
-            config.hidden_size,
-            config.intermediate_size * 2,    # 3072 * 2 = 6144，前半是 gate，后半是 up
-            bias=False,
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
+        # 分开的 gate 和 up 投影——和 checkpoint 名字对齐
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        # x: [batch, seq_len, hidden_size]
-        gate_up = self.gate_up_proj(x)                # [batch, seq, 6144]
-        gate, up = gate_up.chunk(2, dim=-1)            # 各 [batch, seq, 3072]
-        x = torch.nn.functional.silu(gate) * up        # SiLU(a) * b
-        return self.down_proj(x)                       # [batch, seq, 1024]
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -287,97 +273,36 @@ class Qwen3ForCausalLM(nn.Module):
 
 
 def load_weights(model, checkpoint_path):
-    """把 Qwen3 checkpoint 权重加载到我们的模型里。
-
-    用 Python 原生 open/read 读 safetensors，不用 mmap，
-    避免 Windows 页面文件限制的问题。
-    """
+    """全部参数名和 checkpoint 对齐，直接一一映射，不需要拼接。"""
     import struct
 
     with open(checkpoint_path, "rb") as f:
-        # 1. 读目录
         header_size = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(header_size).decode("utf-8"))
-
-        # 2. 建立层数（用于拼接判断）
-        num_layers = sum(1 for m in model.modules() if isinstance(m, Qwen3DecoderLayer))
         device = next(model.parameters()).device
-
-        # 暂存需要拼接的张量
-        qkv_pending = {}       # layer_idx → {"q": tensor, "k": tensor, "v": tensor}
-        gate_up_pending = {}   # layer_idx → {"gate": tensor, "up": tensor}
 
         for name, info in header.items():
             if name == "__metadata__":
                 continue
             if name == "lm_head.weight":
-                continue   # tie_word_embeddings，和 embed_tokens 共享，跳过
+                continue   # tie_word_embeddings
 
-            # --- 需要拼接的：先暂存 ---
-            matched = False
-
-            # 检查是否 q_proj / k_proj / v_proj
-            for layer_idx in range(num_layers):
-                prefix = f"model.layers.{layer_idx}.self_attn"
-                if name == f"{prefix}.q_proj.weight":
-                    qkv_pending.setdefault(layer_idx, {})["q"] = _read_tensor(f, info, header_size, device)
-                    matched = True; break
-                if name == f"{prefix}.k_proj.weight":
-                    qkv_pending.setdefault(layer_idx, {})["k"] = _read_tensor(f, info, header_size, device)
-                    matched = True; break
-                if name == f"{prefix}.v_proj.weight":
-                    qkv_pending.setdefault(layer_idx, {})["v"] = _read_tensor(f, info, header_size, device)
-                    matched = True; break
-            if matched:
-                continue
-
-            # 检查是否 gate_proj / up_proj
-            for layer_idx in range(num_layers):
-                prefix = f"model.layers.{layer_idx}.mlp"
-                if name == f"{prefix}.gate_proj.weight":
-                    gate_up_pending.setdefault(layer_idx, {})["gate"] = _read_tensor(f, info, header_size, device)
-                    matched = True; break
-                if name == f"{prefix}.up_proj.weight":
-                    gate_up_pending.setdefault(layer_idx, {})["up"] = _read_tensor(f, info, header_size, device)
-                    matched = True; break
-            if matched:
-                continue
-
-            # --- 直接映射 ---
-            tensor = _read_tensor(f, info, header_size, device)
+            tensor = _read_tensor(f, info, header_size, device).to(device)
             model.get_parameter(name).data.copy_(tensor)
-
-    # === 拼接 qkv_proj ===
-    for layer_idx in range(num_layers):
-        parts = qkv_pending.get(layer_idx, {})
-        if len(parts) == 3:
-            prefix = f"model.layers.{layer_idx}.self_attn"
-            merged = torch.cat([parts["q"], parts["k"], parts["v"]], dim=0)
-            model.get_parameter(f"{prefix}.qkv_proj.weight").data.copy_(merged)
-
-    # === 拼接 gate_up_proj ===
-    for layer_idx in range(num_layers):
-        parts = gate_up_pending.get(layer_idx, {})
-        if len(parts) == 2:
-            prefix = f"model.layers.{layer_idx}.mlp"
-            merged = torch.cat([parts["gate"], parts["up"]], dim=0)
-            model.get_parameter(f"{prefix}.gate_up_proj.weight").data.copy_(merged)
 
     print("权重加载完成!")
 
 
 def _read_tensor(f, info, header_size, device):
-    """从文件读一个张量：seek → read → frombuffer → reshape → to device"""
+    """从文件读一个张量：seek → read → frombuffer → reshape（CPU），调用者负责 .to(device)"""
     start, end = info["data_offsets"]
     f.seek(8 + header_size + start)
     raw = f.read(end - start)
 
-    # dtype 映射
     dtype_map = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
     dtype = dtype_map[info["dtype"]]
 
-    tensor = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(info["shape"])
-    return tensor.to(device)
+    return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(info["shape"])
         
 
 
