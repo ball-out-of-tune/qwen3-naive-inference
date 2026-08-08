@@ -2,6 +2,34 @@ from dataclasses import dataclass
 import json
 import torch
 import torch.nn as nn
+from flash_attn import flash_attn_varlen_func
+
+
+@dataclass
+class VarlenContext:
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    positions: torch.Tensor
+
+
+_VARLEN_CTX = None
+
+
+def set_varlen_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, positions):
+    global _VARLEN_CTX
+    _VARLEN_CTX = VarlenContext(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, positions)
+
+
+def get_varlen_context():
+    return _VARLEN_CTX
+
+
+def clear_varlen_context():
+    global _VARLEN_CTX
+    _VARLEN_CTX = None
+
 
 @dataclass
 class Qwen3Config:
@@ -80,12 +108,19 @@ class RotaryEmbedding(nn.Module):
         orig_dtype_q = q.dtype
         orig_dtype_k = k.dtype
 
-        # cos/sin: [seq_len, head_dim//2] each
-        cos_sin = self.cos_sin_cache[positions]            # [seq_len, head_dim]
-        cos, sin = cos_sin.chunk(2, dim=-1)                # each [seq_len, head_dim//2]
-        # 加 batch 和 heads 维度用于广播
-        cos = cos.unsqueeze(0).unsqueeze(2)                # [1, seq_len, 1, head_dim//2]
-        sin = sin.unsqueeze(0).unsqueeze(2)
+        # cos/sin: [seq_len, head_dim//2] or [total_tokens, head_dim//2] each
+        cos_sin = self.cos_sin_cache[positions]            # [N, head_dim]
+        cos, sin = cos_sin.chunk(2, dim=-1)                # each [N, head_dim//2]
+
+        # 根据输入维度调整广播形状
+        if q.dim() == 4:
+            # [batch, seq, heads, dim] → cos/sin: [1, seq, 1, head_dim//2]
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
+        else:
+            # varlen: [tokens, heads, dim] → cos/sin: [tokens, 1, head_dim//2]
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
 
         def rotate(x, x_orig_dtype):
             x_f32 = x.float()
@@ -96,7 +131,7 @@ class RotaryEmbedding(nn.Module):
 
         q = rotate(q, orig_dtype_q)
         k = rotate(k, orig_dtype_k)
-        return q, k 
+        return q, k
 
 class Qwen3Attention(nn.Module):
     """GQA + QK-Norm + RoPE —— Qwen3 的 attention 层"""
@@ -121,12 +156,85 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # KV Cache（单序列，按需分配）
+        self.k_cache = None
+        self.v_cache = None
+
         # RoPE：旋转位置编码
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
             config.max_position_embeddings,
             config.rope_theta,
         )
+
+    def allocate_cache(self, batch_size, max_len):
+        """分配 KV cache 显存：[batch, max_len, kv_heads, head_dim]"""
+        self.k_cache = torch.empty(batch_size, max_len, self.num_kv_heads, self.head_dim)
+        self.v_cache = torch.empty(batch_size, max_len, self.num_kv_heads, self.head_dim)
+
+    def forward_kv_cache(self, x, positions, is_prefill, cache_pos):
+        """
+        x:          [batch, seq_len, hidden_size]  prefill=全prompt, decode=1个新token
+        positions:  [seq_len]  绝对位置（decode 时 = [当前序号]）
+        cache_pos:  [seq_len]  K/V 存入 cache 的位置
+        """
+        batch, seq_len, _ = x.shape
+
+        # 1. QKV 投影
+        q = self.q_proj(x)    # [batch, seq, q_size]
+        k = self.k_proj(x)    # [batch, seq, kv_size]
+        v = self.v_proj(x)    # [batch, seq, kv_size]
+
+        # 2. view
+        q = q.view(batch, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim)
+
+        # 3. QK-Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 4. RoPE（用绝对位置）
+        q, k = self.rotary_emb(q, k, positions)
+
+        # 5. K/V 存入 cache
+        self.k_cache[:, cache_pos] = k
+        self.v_cache[:, cache_pos] = v
+
+        if is_prefill:
+            # prefill: 用刚刚算出的 K/V 做 attention（已存 cache，但 cache 里也只有这些）
+            k_used = k
+            v_used = v
+        else:
+            # decode: 从 cache 读所有历史的 K/V（包括刚存进去的）
+            k_used = self.k_cache[:, :cache_pos[-1] + 1]  # [batch, all_positions, kv_heads, dim]
+            v_used = self.v_cache[:, :cache_pos[-1] + 1]
+
+        # 6. transpose → [batch, heads, seq, dim]
+        q = q.transpose(1, 2)
+        k_used = k_used.transpose(1, 2)
+        v_used = v_used.transpose(1, 2)
+
+        # 7. GQA: repeat KV
+        k_used, v_used = self._repeat_kv(k_used, v_used)
+
+        # 8. Scaled dot-product attention
+        attn_scores = (q @ k_used.transpose(-2, -1)) * self.scale
+
+        # prefill 需要 causal mask，decode 不需要（Q 只有 1 token，天然单向）
+        if is_prefill:
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=x.device), diagonal=1
+            ).bool()
+            neg_inf = torch.tensor(float('-inf'), dtype=attn_scores.dtype, device=attn_scores.device)
+            attn_scores = attn_scores.masked_fill(causal_mask, neg_inf)
+
+        attn_weights = torch.softmax(attn_scores.float(), dim=-1).to(attn_scores.dtype)
+        attn_output = attn_weights @ v_used
+
+        # 9. merge heads → output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.o_proj(attn_output)
 
     def _repeat_kv(self, k, v):
         """GQA：把 KV 从 num_kv_heads 复制到 num_heads"""
@@ -136,6 +244,40 @@ class Qwen3Attention(nn.Module):
         return k, v
 
     def forward(self, x):
+        ctx = get_varlen_context()
+
+        if ctx is not None:
+            # ===== Varlen 路径: [total_tokens, hidden] =====
+            tokens, _ = x.shape
+
+            q = self.q_proj(x)    # [tokens, q_size]
+            k = self.k_proj(x)    # [tokens, kv_size]
+            v = self.v_proj(x)    # [tokens, kv_size]
+
+            q = q.view(tokens, self.num_heads, self.head_dim)
+            k = k.view(tokens, self.num_kv_heads, self.head_dim)
+            v = v.view(tokens, self.num_kv_heads, self.head_dim)
+
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+            q, k = self.rotary_emb(q, k, ctx.positions)
+
+            # flash_attn 原生处理 GQA，q/k/v 头数可以不同
+            o = flash_attn_varlen_func(
+                q, k, v,
+                max_seqlen_q=ctx.max_seqlen_q,
+                cu_seqlens_q=ctx.cu_seqlens_q,
+                max_seqlen_k=ctx.max_seqlen_k,
+                cu_seqlens_k=ctx.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+
+            o = o.view(tokens, -1)  # [tokens, q_size]
+            return self.o_proj(o)
+
+        # ===== 原路径: [batch, seq, hidden] =====
         batch, seq_len, _ = x.shape
 
         # 1. 分开投影 Q、K、V
@@ -209,6 +351,14 @@ class Qwen3DecoderLayer(nn.Module):
         x = self.mlp(self.post_attention_layernorm(x)) + x
         return x
 
+    def forward_kvcache(self, x, positions, is_prefill, cache_pos):
+        # RMSNorm 和 MLP 不变，只有 attention 改用 cache 版本
+        x = self.self_attn.forward_kv_cache(
+            self.input_layernorm(x), positions, is_prefill, cache_pos
+        ) + x
+        x = self.mlp(self.post_attention_layernorm(x)) + x
+        return x
+
 
 class Qwen3Model(nn.Module):
     """token embedding → 28 层 decoder → 最终 norm"""
@@ -229,6 +379,13 @@ class Qwen3Model(nn.Module):
         h = self.norm(h)
         return h
 
+    def forward_kvcache(self, x, positions, is_prefill, cache_pos):
+        h = self.embed_tokens(x)
+        for layer in self.layers:
+            h = layer.forward_kvcache(h, positions, is_prefill, cache_pos)
+        h = self.norm(h)
+        return h
+
 
 class Qwen3ForCausalLM(nn.Module):
     """Qwen3 模型总入口：Model + lm_head"""
@@ -245,6 +402,59 @@ class Qwen3ForCausalLM(nn.Module):
     def forward(self, x):
         h = self.model(x)                      # [batch, seq, hidden_size]
         return self.lm_head(h)                 # [batch, seq, vocab_size]
+
+    def allocate_kv_cache(self, batch_size, max_len):
+        """给所有 attention 层分配 KV cache"""
+        for layer in self.model.layers:
+            layer.self_attn.allocate_cache(batch_size, max_len)
+
+    @torch.no_grad()
+    def generate_kvcache(self, prompt, max_new_tokens=256, temperature=0.6, top_k=20, eos_token_ids=None):
+        """KV-Cache 版生成：prefill 一次 + decode N 次"""
+        batch_size, prompt_len = prompt.shape
+        max_len = prompt_len + max_new_tokens
+        self.allocate_kv_cache(batch_size, max_len)
+
+        # === Prefill: 一次性 forward 整个 prompt ===
+        positions = torch.arange(0, prompt_len, device=prompt.device)
+        cache_pos = torch.arange(0, prompt_len, device=prompt.device)
+        h = self.model.forward_kvcache(prompt, positions, is_prefill=True, cache_pos=cache_pos)
+        logits = self.lm_head(h)[:, -1, :] / temperature
+
+        # top-k
+        if top_k is not None:
+            topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
+            neg_inf = torch.tensor(float('-inf'), dtype=logits.dtype, device=logits.device)
+            logits = torch.full_like(logits, neg_inf).scatter(-1, topk_idx, topk_vals)
+
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)  # [1, 1]
+        generated = torch.cat([prompt, next_token], dim=1)
+
+        # === Decode loop ===
+        for step in range(max_new_tokens - 1):
+            current_pos = prompt_len + step                                        # 当前绝对位置
+            positions = torch.tensor([current_pos], device=prompt.device)
+            cache_pos = torch.tensor([current_pos], device=prompt.device)
+
+            one_token = next_token  # already [1, 1] = [batch, 1 token]
+            h = self.model.forward_kvcache(one_token, positions, is_prefill=False, cache_pos=cache_pos)
+            logits = self.lm_head(h)[:, -1, :] / temperature
+
+            if top_k is not None:
+                topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
+                neg_inf = torch.tensor(float('-inf'), dtype=logits.dtype, device=logits.device)
+                logits = torch.full_like(logits, neg_inf).scatter(-1, topk_idx, topk_vals)
+
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            if eos_token_ids is not None and next_token.item() in eos_token_ids:
+                break
+
+            generated = torch.cat([generated, next_token], dim=1)
+
+        return generated
 
     @torch.no_grad()
     def generate_naive(self, prompt, max_new_tokens=256, temperature=0.6, top_k=20, eos_token_ids=None):
@@ -269,6 +479,84 @@ class Qwen3ForCausalLM(nn.Module):
 
             generated = torch.cat([generated, next_token], dim=1)
         return generated
+
+    @torch.no_grad()
+    def generate_varlen(self, prompt_ids_list, max_new_tokens=256, temperature=0.6,
+                        top_k=20, eos_token_ids=None):
+        """Varlen 批量生成：多条 prompt 同时推理，不填充，不浪费计算。
+
+        prompt_ids_list: list of [1, prompt_len_i] tensors，每条 prompt 的 tokenized 结果
+        """
+        batch_size = len(prompt_ids_list)
+        # 每条序列当前的完整 token 列表
+        seq_tokens = [p[0].tolist() for p in prompt_ids_list]
+        unfinished = [True] * batch_size
+        all_generated = [[] for _ in range(batch_size)]
+
+        for step in range(max_new_tokens):
+            # ---- 1. 构建 varlen 输入 ----
+            all_ids = []
+            all_positions = []
+            cu_seqlens = [0]
+            max_seqlen = 0
+
+            for tokens in seq_tokens:
+                L = len(tokens)
+                all_ids.extend(tokens)
+                all_positions.extend(range(L))
+                cu_seqlens.append(cu_seqlens[-1] + L)
+                max_seqlen = max(max_seqlen, L)
+
+            input_ids = torch.tensor(all_ids, dtype=torch.long, device='cuda')
+            cu_sl = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
+            positions = torch.tensor(all_positions, dtype=torch.long, device='cuda')
+
+            # ---- 2. 设置 varlen context，forward ----
+            set_varlen_context(
+                cu_seqlens_q=cu_sl,
+                cu_seqlens_k=cu_sl,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                positions=positions,
+            )
+            logits = self.forward(input_ids)   # [total_tokens, vocab]
+            clear_varlen_context()
+
+            # ---- 3. 取每条序列最后一个 token 的 logit ----
+            last_logits_list = []
+            for i in range(batch_size):
+                last_idx = cu_seqlens[i + 1] - 1
+                last_logits_list.append(logits[last_idx])
+            last_logits = torch.stack(last_logits_list)      # [batch, vocab]
+
+            # ---- 4. temperature + top-k + sample ----
+            last_logits = last_logits / temperature
+
+            if top_k is not None:
+                topk_vals, topk_idx = torch.topk(last_logits, top_k, dim=-1)
+                neg_inf = torch.tensor(float('-inf'), dtype=last_logits.dtype,
+                                       device=last_logits.device)
+                filtered = torch.full_like(last_logits, neg_inf)
+                last_logits = filtered.scatter(-1, topk_idx, topk_vals)
+
+            probs = torch.softmax(last_logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)   # [batch, 1]
+
+            # ---- 5. 更新序列状态 ----
+            for i in range(batch_size):
+                if not unfinished[i]:
+                    continue
+                token_id = next_tokens[i].item()
+                seq_tokens[i].append(token_id)
+                all_generated[i].append(token_id)
+
+                if eos_token_ids is not None and token_id in eos_token_ids:
+                    unfinished[i] = False
+
+            if not any(unfinished):
+                break
+
+        return seq_tokens, all_generated
 
 
 def load_weights(model, checkpoint_path):
@@ -361,7 +649,7 @@ if __name__ == '__main__':
     import sys
     from transformers import AutoTokenizer
 
-    model_path = "C:/Users/16874/Downloads/Qwen3-0.6B"
+    model_path = "/mnt/c/Users/16874/Downloads/Qwen3-0.6B"
 
     # 1. 加载 tokenizer
     print("加载 tokenizer...")
@@ -385,34 +673,104 @@ if __name__ == '__main__':
         bench(model, config)
         sys.exit(0)
 
-    # 3. 输入 prompt（使用聊天模板）
-    prompt_text = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "你好，请介绍一下你自己"
-    messages = [{"role": "user", "content": prompt_text}]
-    formatted = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    prompt_ids = tokenizer.encode(formatted, return_tensors="pt").to('cuda')
-    print(f"\nPrompt: {prompt_text}")
-    print(f"Token IDs: {prompt_ids.tolist()[0][:8]}...  ({prompt_ids.shape[1]} tokens)")
-
-    # 4. 生成
+    # 3. 选择生成模式
     use_topk = "--no-topk" not in sys.argv
     top_k = 20 if use_topk else None
     if not use_topk:
         print("(top_k=None, 全词表采样)")
 
-    print("\n生成中...")
-    output_ids = model.generate_naive(
-        prompt_ids,
-        max_new_tokens=256,
-        temperature=0.6,
-        top_k=top_k,
-        eos_token_ids=[config.eos_token_id, config.bos_token_id],  # Qwen3 用两个 EOS
-    )
-    print(f"生成完成: {output_ids.shape[1]} tokens total")
+    use_kvcache = "--kvcache" in sys.argv
+    use_varlen = "--varlen" in sys.argv
 
-    # 5. 解码输出
-    output_text = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
-    print(f"\n{'='*50}")
-    print(output_text)
-    print(f"{'='*50}")
+    if use_varlen:
+        # ===== Varlen 模式：多 prompt 批量推理 =====
+        # 读取 prompts
+        prompts_file = None
+        for arg in sys.argv:
+            if arg.startswith("--prompts-file="):
+                prompts_file = arg.split("=", 1)[1]
+
+        if prompts_file:
+            with open(prompts_file, "r", encoding="utf-8") as f:
+                prompt_texts = [line.strip() for line in f if line.strip()]
+        else:
+            prompt_texts = [
+                "你好，请介绍一下你自己",
+                "今天天气怎么样？",
+                "什么是人工智能？",
+                "推荐三本科幻小说",
+            ]
+
+        print(f"\nVarlen batch 模式: {len(prompt_texts)} 条 prompt")
+
+        # tokenize 每条 prompt
+        prompt_ids_list = []
+        for i, text in enumerate(prompt_texts):
+            messages = [{"role": "user", "content": text}]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            ids = tokenizer.encode(formatted, return_tensors="pt").to('cuda')
+            prompt_ids_list.append(ids)
+            print(f"  [{i}] {text[:30]}... ({ids.shape[1]} tokens)")
+
+        # 生成
+        print(f"\n生成中 (Varlen, batch={len(prompt_texts)})...")
+        torch.manual_seed(42)
+        torch.cuda.synchronize()
+        t0 = __import__('time').time()
+        seq_tokens, all_generated = model.generate_varlen(
+            prompt_ids_list,
+            max_new_tokens=256,
+            temperature=0.6,
+            top_k=top_k,
+            eos_token_ids=[config.eos_token_id, config.bos_token_id],
+        )
+        torch.cuda.synchronize()
+        elapsed = __import__('time').time() - t0
+
+        total_new = sum(len(g) for g in all_generated)
+        print(f"生成完成: {total_new} new tokens / {elapsed:.1f}s = {total_new/elapsed:.1f} tok/s")
+
+        # 解码输出
+        for i, (seq, generated) in enumerate(zip(seq_tokens, all_generated)):
+            output_text = tokenizer.decode(seq, skip_special_tokens=True)
+            print(f"\n{'='*50}")
+            print(f"[第 {i+1} 条] 生成 {len(generated)} tokens:")
+            print(output_text)
+            print(f"{'='*50}")
+    else:
+        # ===== 单 prompt 模式（原逻辑）=====
+        prompt_text = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "你好，请介绍一下你自己"
+        messages = [{"role": "user", "content": prompt_text}]
+        formatted = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        prompt_ids = tokenizer.encode(formatted, return_tensors="pt").to('cuda')
+        print(f"\nPrompt: {prompt_text}")
+        print(f"Token IDs: {prompt_ids.tolist()[0][:8]}...  ({prompt_ids.shape[1]} tokens)")
+
+        # 生成
+        generate_fn = model.generate_kvcache if use_kvcache else model.generate_naive
+        mode = "KV-Cache" if use_kvcache else "Naive"
+        print(f"\n生成中 ({mode})...")
+        torch.manual_seed(42)
+        torch.cuda.synchronize()
+        t0 = __import__('time').time()
+        output_ids = generate_fn(
+            prompt_ids,
+            max_new_tokens=256,
+            temperature=0.6,
+            top_k=top_k,
+            eos_token_ids=[config.eos_token_id, config.bos_token_id],
+        )
+        torch.cuda.synchronize()
+        elapsed = __import__('time').time() - t0
+        new_tokens = output_ids.shape[1] - prompt_ids.shape[1]
+        print(f"生成完成: {new_tokens} new tokens / {elapsed:.1f}s = {new_tokens/elapsed:.1f} tok/s")
+
+        # 解码输出
+        output_text = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
+        print(f"\n{'='*50}")
+        print(output_text)
+        print(f"{'='*50}")
