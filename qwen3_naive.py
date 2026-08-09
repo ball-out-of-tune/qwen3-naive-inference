@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import json
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass
@@ -94,6 +94,87 @@ class BadRMSNorm:
     def forward(self, x):
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x / rms * self.weight
+
+
+# ===================== Continuous Batching 组件 =====================
+
+class Sequence:
+    """一条推理请求的完整状态"""
+
+    BLOCK_SIZE = 256
+
+    def __init__(self, token_ids: list[int], sampling_params: dict = None):
+        self.token_ids = list(token_ids)
+        self.num_prompt_tokens = len(token_ids)
+        self.last_token = token_ids[-1]
+        self.status = "WAITING"       # WAITING → RUNNING → FINISHED
+        self.block_table = []         # 页表: [3, 7, 12] — 逻辑块→物理块
+        self.cached_len = 0           # 已写入 KV cache 的 token 数量
+        sp = sampling_params or {}
+        self.temperature = sp.get("temperature", 0.6)
+        self.max_tokens = sp.get("max_tokens", 256)
+
+    def append_token(self, token_id: int):
+        self.token_ids.append(token_id)
+        self.last_token = token_id
+
+    @property
+    def num_tokens(self):
+        return len(self.token_ids)
+
+    @property
+    def num_blocks(self):
+        return (len(self.token_ids) + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
+
+    @property
+    def num_completion_tokens(self):
+        return len(self.token_ids) - self.num_prompt_tokens
+
+    @property
+    def unfinished(self):
+        return self.status != "FINISHED"
+
+    @property
+    def prompt_len(self):
+        return self.num_prompt_tokens
+
+
+class BlockManager:
+    """页式 KV cache 管理：按需分配 256-token 的块"""
+
+    def __init__(self, num_blocks: int, block_size: int):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.free = list(range(num_blocks))
+
+    def allocate(self, seq: Sequence):
+        """分配刚好够用的块数，填进 seq.block_table"""
+        n = seq.num_blocks
+        assert len(self.free) >= n, f"need {n} blocks, have {len(self.free)}"
+        for _ in range(n):
+            seq.block_table.append(self.free.pop())
+
+    def deallocate(self, block_table: list[int]):
+        """归还所有块"""
+        for b in block_table:
+            self.free.append(b)
+
+    def can_append(self, seq: Sequence) -> bool:
+        """长度刚跨过 256 边界时需要新块，有空闲吗"""
+        need = seq.num_tokens % self.block_size == 0
+        return (not need) or len(self.free) > 0
+
+    def may_append(self, seq: Sequence):
+        """需要就追加"""
+        if seq.num_tokens % self.block_size == 0:
+            seq.block_table.append(self.free.pop())
+
+    @property
+    def available(self):
+        return len(self.free)
+
+
+# ================================================================
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, max_position, rope_theta):
@@ -320,6 +401,100 @@ class Qwen3Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(attn_output)
 
+    # ===== Continuous Batching: Prefill 和 Decode 路径 =====
+
+    def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
+                        max_seqlen_q, max_seqlen_k, block_mapping):
+        """
+        Prefill: 一次性处理多条序列的 prompt，K/V 写入全局 cache。
+
+        x:             [total_tokens, hidden]
+        positions:     [total_tokens]  各 token 在各自序列内的位置
+        cu_seqlens_*:  [num_seqs + 1]  累积序列长度
+        block_mapping: [total_tokens]  每个 token 对应 cache 位置 = blk * BLOCK_SIZE + off
+        """
+        tokens, _ = x.shape
+
+        q = self.q_proj(x)        # [tokens, q_size]
+        k = self.k_proj(x)        # [tokens, kv_size]
+        v = self.v_proj(x)        # [tokens, kv_size]
+
+        q = q.view(tokens, self.num_heads, self.head_dim)
+        k = k.view(tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(tokens, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q, k = self.rotary_emb(q, k, positions)
+
+        # 把 K/V 存入全局 cache（block_mapping 是展平后的物理地址）
+        if self.k_cache.numel():
+            k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
+            v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
+            k_flat[block_mapping] = k
+            v_flat[block_mapping] = v
+
+        o = flash_attn_varlen_func(
+            q, k, v,
+            max_seqlen_q=max_seqlen_q, cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k, cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=self.scale, causal=True,
+        )
+
+        o = o.view(tokens, -1)
+        return self.o_proj(o)
+
+    def forward_decode(self, x, positions, context_lens, block_tables):
+        """
+        Decode: 每个序列只算 1 个新 token，从全局 cache 读历史 K/V。
+
+        x:            [batch, hidden]   batch 条序列，各 1 个 token
+        positions:    [batch]           每个新 token 的绝对位置
+        context_lens: [batch]           每个序列已缓存的 K/V 数量（写新 token 前）
+        block_tables: [batch, max_blocks] 页表，-1 填充
+        """
+        batch = x.shape[0]
+
+        q = self.q_proj(x)          # [batch, q_size]
+        k_new = self.k_proj(x)      # [batch, kv_size]
+        v_new = self.v_proj(x)      # [batch, kv_size]
+
+        q = q.view(batch, self.num_heads, self.head_dim)
+        k_new = k_new.view(batch, self.num_kv_heads, self.head_dim)
+        v_new = v_new.view(batch, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k_new = self.k_norm(k_new)
+
+        q, k_new = self.rotary_emb(q, k_new, positions)
+
+        # 把新 K/V 写入全局 cache（查页表找物理地址）
+        if self.k_cache.numel():
+            k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
+            v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
+            for i in range(batch):
+                pos = context_lens[i].item()                # 新 token 的逻辑位置
+                blk = block_tables[i, pos // 256].item()    # 查页表
+                off = pos % 256
+                idx = blk * 256 + off
+                k_flat[idx] = k_new[i]
+                v_flat[idx] = v_new[i]
+
+        # flash_attn 从 cache 读历史 K/V（靠 block_table 寻址）
+        o = flash_attn_with_kvcache(
+            q.unsqueeze(1),                  # [batch, 1, num_heads, dim]
+            self.k_cache,                    # [num_blocks, block_size, kv_heads, dim]
+            self.v_cache,
+            cache_seqlens=context_lens + 1,  # 刚追加了 1 个
+            block_table=block_tables,        # ★ 页表
+            softmax_scale=self.scale,
+            causal=True,
+        )
+
+        o = o.squeeze(1).view(batch, -1)     # [batch, q_size]
+        return self.o_proj(o)
+
 
 class Qwen3MLP(nn.Module):
     """SwiGLU —— Qwen3 的 FFN 层"""
@@ -359,6 +534,22 @@ class Qwen3DecoderLayer(nn.Module):
         x = self.mlp(self.post_attention_layernorm(x)) + x
         return x
 
+    def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
+                        max_seqlen_q, max_seqlen_k, block_mapping):
+        x = self.self_attn.forward_prefill(
+            self.input_layernorm(x), positions,
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, block_mapping,
+        ) + x
+        x = self.mlp(self.post_attention_layernorm(x)) + x
+        return x
+
+    def forward_decode(self, x, positions, context_lens, block_tables):
+        x = self.self_attn.forward_decode(
+            self.input_layernorm(x), positions, context_lens, block_tables,
+        ) + x
+        x = self.mlp(self.post_attention_layernorm(x)) + x
+        return x
+
 
 class Qwen3Model(nn.Module):
     """token embedding → 28 层 decoder → 最终 norm"""
@@ -383,6 +574,22 @@ class Qwen3Model(nn.Module):
         h = self.embed_tokens(x)
         for layer in self.layers:
             h = layer.forward_kvcache(h, positions, is_prefill, cache_pos)
+        h = self.norm(h)
+        return h
+
+    def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
+                        max_seqlen_q, max_seqlen_k, block_mapping):
+        h = self.embed_tokens(x)
+        for layer in self.layers:
+            h = layer.forward_prefill(h, positions, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q, max_seqlen_k, block_mapping)
+        h = self.norm(h)
+        return h
+
+    def forward_decode(self, x, positions, context_lens, block_tables):
+        h = self.embed_tokens(x)
+        for layer in self.layers:
+            h = layer.forward_decode(h, positions, context_lens, block_tables)
         h = self.norm(h)
         return h
 
@@ -558,6 +765,181 @@ class Qwen3ForCausalLM(nn.Module):
 
         return seq_tokens, all_generated
 
+    # ===================== Continuous Batching =====================
+
+    NUM_BLOCKS = 64
+    BLOCK_SIZE = 256
+
+    def allocate_global_kv_cache(self):
+        """分配全局 KV cache：[layers, num_blocks, block_size, kv_heads, dim]"""
+        config = self.model.layers[0].self_attn
+        num_layers = len(self.model.layers)
+        n_kv = config.num_kv_heads
+        d = config.head_dim
+
+        k = torch.empty(num_layers, self.NUM_BLOCKS, self.BLOCK_SIZE, n_kv, d,
+                        dtype=torch.bfloat16, device='cuda')
+        v = torch.empty(num_layers, self.NUM_BLOCKS, self.BLOCK_SIZE, n_kv, d,
+                        dtype=torch.bfloat16, device='cuda')
+
+        for i, layer in enumerate(self.model.layers):
+            layer.self_attn.k_cache = k[i]
+            layer.self_attn.v_cache = v[i]
+
+    def _prepare_prefill(self, seqs: list[Sequence]):
+        """构建 varlen prefill 输入和 block_mapping"""
+        input_ids, positions = [], []
+        cu_seqlens_q = [0]
+        max_seqlen = 0
+        block_mapping = []
+
+        for seq in seqs:
+            L = seq.num_prompt_tokens  # prefill 时整个 prompt 一次性处理
+            input_ids.extend(seq.token_ids[:L])
+            positions.extend(range(L))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + L)
+            max_seqlen = max(max_seqlen, L)
+
+            # 每个 token → 物理块号 (页表查表) × BLOCK_SIZE + 块内偏移
+            for pos in range(L):
+                blk = seq.block_table[pos // self.BLOCK_SIZE]
+                off = pos % self.BLOCK_SIZE
+                block_mapping.append(blk * self.BLOCK_SIZE + off)
+
+        device = 'cuda'
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+        positions = torch.tensor(positions, dtype=torch.long, device=device)
+        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
+        blk_map = torch.tensor(block_mapping, dtype=torch.int32, device=device)
+
+        return input_ids, positions, cu_q, cu_q, max_seqlen, max_seqlen, blk_map
+
+    def _prepare_decode(self, seqs: list[Sequence]):
+        """构建 decode 输入：block_tables 用于 flash_attn 寻址"""
+        device = 'cuda'
+        input_ids = torch.tensor([s.last_token for s in seqs], dtype=torch.long, device=device)
+        positions = torch.tensor([s.num_tokens - 1 for s in seqs], dtype=torch.long, device=device)
+        context_lens = torch.tensor([s.cached_len for s in seqs], dtype=torch.int32, device=device)
+
+        # block_tables: [batch, max_blocks]  短序列填 -1
+        max_blocks = max(len(s.block_table) for s in seqs)
+        bt = torch.full((len(seqs), max_blocks), -1, dtype=torch.int32, device=device)
+        for i, s in enumerate(seqs):
+            bt[i, :len(s.block_table)] = torch.tensor(s.block_table, dtype=torch.int32, device=device)
+
+        return input_ids, positions, context_lens, bt
+
+    @torch.no_grad()
+    def generate_continuous(self, prompt_ids_list, max_new_tokens=256,
+                            temperature=0.6, top_k=20, eos_token_ids=None):
+        """
+        Continuous Batching: 序列可以随时加入，完成的序列即时退出。
+        简化版策略：优先 prefill 所有 waiting，再 decode 所有 running。
+        """
+        bm = BlockManager(self.NUM_BLOCKS, self.BLOCK_SIZE)
+        self.allocate_global_kv_cache()
+
+        # 用 prompt_ids_list 创建 Sequence
+        waiting: list[Sequence] = []
+        for pids in prompt_ids_list:
+            token_ids = pids[0].tolist()
+            waiting.append(Sequence(token_ids, {"temperature": temperature, "max_tokens": max_new_tokens}))
+
+        running: list[Sequence] = []
+        all_seqs = list(waiting)  # 保留引用，最终用来取结果
+
+        while waiting or running:
+            # ---- Scheduler: 优先 prefill，有空闲块就接新请求 ----
+            pref_seqs: list[Sequence] = []
+            while waiting:
+                seq = waiting[0]
+                # 先分配块，不够就不拉进来
+                needed = seq.num_blocks
+                if bm.available < needed:
+                    break
+                bm.allocate(seq)
+                waiting.pop(0)
+                seq.status = "RUNNING"
+                running.append(seq)
+                pref_seqs.append(seq)
+
+            if pref_seqs:
+                # ---- Prefill ----
+                input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map = self._prepare_prefill(pref_seqs)
+                h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map)
+                logits = self.lm_head(h)
+
+                # 关键：prefill 完成后，整个 prompt 已经写进 KV cache
+                for seq in pref_seqs:
+                    seq.cached_len = seq.num_prompt_tokens
+
+                # 取每条序列最后一个 token 的 logit
+                last_logits = torch.stack([
+                    logits[cu_q[i + 1] - 1] for i in range(len(pref_seqs))
+                ])
+                seqs_step = pref_seqs
+                is_prefill_step = True
+            else:
+                # ---- Decode ----
+                # 检查哪些序列需要追加块（deocde 越过 256 边界）
+                for seq in list(running):
+                    if not bm.can_append(seq):
+                        # 没有空闲块 → 驱逐
+                        seq.status = "WAITING"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        seq.cached_len = 0
+                        running.remove(seq)
+                        waiting.insert(0, seq)
+                    else:
+                        bm.may_append(seq)
+
+                if not running:
+                    # 全部被驱逐了
+                    continue
+
+                input_ids, pos, ctx_lens, block_tables = self._prepare_decode(running)
+                h = self.model.forward_decode(input_ids, pos, ctx_lens, block_tables)
+                last_logits = self.lm_head(h)
+                seqs_step = running
+                is_prefill_step = False
+
+            # ---- 采样 ----
+            last_logits = last_logits / temperature
+            if top_k is not None:
+                topk_vals, topk_idx = torch.topk(last_logits, top_k, dim=-1)
+                neg_inf = torch.tensor(float('-inf'), dtype=last_logits.dtype, device=last_logits.device)
+                filtered = torch.full_like(last_logits, neg_inf)
+                last_logits = filtered.scatter(-1, topk_idx, topk_vals)
+
+            probs = torch.softmax(last_logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)   # [N, 1]
+
+            # ---- 更新序列状态 ----
+            for i, seq in enumerate(seqs_step):
+                token_id = next_tokens[i].item()
+                seq.append_token(token_id)
+                if not is_prefill_step:
+                    # decode 步：K/V 刚刚在 forward_decode 里写入了 cache，所以 +1
+                    seq.cached_len += 1
+                # prefill 步：新 token 的 K/V 还没算，第一次 decode 才会算它
+
+                if eos_token_ids is not None and token_id in eos_token_ids:
+                    seq.status = "FINISHED"
+                    bm.deallocate(seq.block_table)
+                    seq.block_table.clear()
+                    running.remove(seq)
+                elif seq.num_completion_tokens >= seq.max_tokens:
+                    seq.status = "FINISHED"
+                    bm.deallocate(seq.block_table)
+                    seq.block_table.clear()
+                    running.remove(seq)
+
+        # 返回结果
+        results = [(s.token_ids, s.token_ids[s.num_prompt_tokens:]) for s in all_seqs]
+        seq_tokens, all_generated = zip(*results)
+        return list(seq_tokens), list(all_generated)
+
 
 def load_weights(model, checkpoint_path):
     """全部参数名和 checkpoint 对齐，直接一一映射，不需要拼接。"""
@@ -681,8 +1063,63 @@ if __name__ == '__main__':
 
     use_kvcache = "--kvcache" in sys.argv
     use_varlen = "--varlen" in sys.argv
+    use_continuous = "--continuous" in sys.argv
 
-    if use_varlen:
+    if use_continuous:
+        # ===== Continuous Batching 模式 =====
+        prompts_file = None
+        for arg in sys.argv:
+            if arg.startswith("--prompts-file="):
+                prompts_file = arg.split("=", 1)[1]
+
+        if prompts_file:
+            with open(prompts_file, "r", encoding="utf-8") as f:
+                prompt_texts = [line.strip() for line in f if line.strip()]
+        else:
+            prompt_texts = [
+                "你好，请介绍一下你自己",
+                "今天天气怎么样？",
+                "什么是人工智能？",
+                "推荐三本科幻小说",
+            ]
+
+        print(f"\nContinuous Batching 模式: {len(prompt_texts)} 条 prompt, {model.NUM_BLOCKS} blocks")
+
+        prompt_ids_list = []
+        for i, text in enumerate(prompt_texts):
+            messages = [{"role": "user", "content": text}]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            ids = tokenizer.encode(formatted, return_tensors="pt").to('cuda')
+            prompt_ids_list.append(ids)
+            print(f"  [{i}] {text[:30]}... ({ids.shape[1]} tokens)")
+
+        print(f"\n生成中 (Continuous Batching)...")
+        torch.manual_seed(42)
+        torch.cuda.synchronize()
+        t0 = __import__('time').time()
+        seq_tokens, all_generated = model.generate_continuous(
+            prompt_ids_list,
+            max_new_tokens=256,
+            temperature=0.6,
+            top_k=top_k,
+            eos_token_ids=[config.eos_token_id, config.bos_token_id],
+        )
+        torch.cuda.synchronize()
+        elapsed = __import__('time').time() - t0
+
+        total_new = sum(len(g) for g in all_generated)
+        print(f"生成完成: {total_new} new tokens / {elapsed:.1f}s = {total_new/elapsed:.1f} tok/s")
+
+        for i, (seq, generated) in enumerate(zip(seq_tokens, all_generated)):
+            output_text = tokenizer.decode(seq, skip_special_tokens=True)
+            print(f"\n{'='*50}")
+            print(f"[第 {i+1} 条] 生成 {len(generated)} tokens:")
+            print(output_text)
+            print(f"{'='*50}")
+
+    elif use_varlen:
         # ===== Varlen 模式：多 prompt 批量推理 =====
         # 读取 prompts
         prompts_file = None
