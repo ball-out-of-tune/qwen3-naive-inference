@@ -894,14 +894,13 @@ class Qwen3ForCausalLM(nn.Module):
     def _compute_num_blocks(self, gpu_memory_utilization=0.9):
         """Warmup forward → 测量峰值显存 → 计算 KV cache block 数。
 
-        参照 nano-vllm 的方法:
-          num_blocks = int(total * util - used - peak + current) // block_bytes
-        其中 peak 是 warmup 期间的峰值分配, current 是 warmup 后的稳态。
+        参照 nano-vllm 用 memory_stats().peak 计算。
+        WSL2 下 memory_stats() 可能返回异常小的值 (< 10MB),
+        此时自动切换到保守估算 (预留 30% 空闲显存给激活)。
         """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        # Warmup: 编译 CUDA kernel + 触发激活峰值
         warmup_tokens = 256
         dummy = torch.randint(0, self.config.vocab_size, (1, warmup_tokens), device='cuda')
         with torch.no_grad():
@@ -913,16 +912,22 @@ class Qwen3ForCausalLM(nn.Module):
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        peak_act = peak - current
 
         attn0 = self.model.layers[0].self_attn
         block_bytes = (2 * len(self.model.layers) * self.BLOCK_SIZE *
                        attn0.num_kv_heads * attn0.head_dim * 2)
 
-        num_blocks = int(total * gpu_memory_utilization - used - peak + current) // block_bytes
-        num_blocks = max(num_blocks, 1)
+        if peak_act < 10 * 1024 * 1024:  # < 10MB — WSL2 bug, 切换到保守模式
+            available = int(total * gpu_memory_utilization - used - free * 0.3)
+        else:
+            available = int(total * gpu_memory_utilization - used - peak_act)
+
+        num_blocks = max(available // block_bytes, 1)
 
         print(f"  KV Cache 动态分配: GPU={total/1e9:.1f}GB, "
-              f"peak={(peak-current)/1e6:.0f}MB, "
+              f"peak_act={peak_act/1e6:.0f}MB"
+              f"{' (WSL2 fallback)' if peak_act < 10*1024*1024 else ''}, "
               f"blocks={num_blocks} ({num_blocks * self.BLOCK_SIZE} tokens)")
         return num_blocks
 
