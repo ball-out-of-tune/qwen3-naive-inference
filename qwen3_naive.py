@@ -887,16 +887,16 @@ class Qwen3ForCausalLM(nn.Module):
     BLOCK_SIZE = 256
 
     def _compute_num_blocks(self, gpu_memory_utilization=0.9):
-        """计算 KV cache 可用 block 数。
+        """Warmup forward → 测量峰值显存 → 计算 KV cache block 数。
 
-        公式: available = total * util - used - activation_reserve
-              num_blocks = available / block_bytes
-
-        activation_reserve = free * 0.3，保守预留 30% 剩余显存给激活。
-        避免依赖 WSL2 下不可靠的 memory_stats()。
+        参照 nano-vllm 的方法:
+          num_blocks = int(total * util - used - peak + current) // block_bytes
+        其中 peak 是 warmup 期间的峰值分配, current 是 warmup 后的稳态。
         """
         torch.cuda.empty_cache()
-        # 触发 lazy allocation + 清理碎片
+        torch.cuda.reset_peak_memory_stats()
+
+        # Warmup: 编译 CUDA kernel + 触发激活峰值
         warmup_tokens = 256
         dummy = torch.randint(0, self.config.vocab_size, (1, warmup_tokens), device='cuda')
         with torch.no_grad():
@@ -906,20 +906,18 @@ class Qwen3ForCausalLM(nn.Module):
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
-        # 预留 30% 空闲显存给激活峰值
-        activation_reserve = int(free * 0.3)
-
-        # block_bytes: 一个 block 的 K + V cache (所有层, bf16)
         attn0 = self.model.layers[0].self_attn
         block_bytes = (2 * len(self.model.layers) * self.BLOCK_SIZE *
                        attn0.num_kv_heads * attn0.head_dim * 2)
 
-        available = int(total * gpu_memory_utilization - used - activation_reserve)
-        num_blocks = max(available // block_bytes, 1)
+        num_blocks = int(total * gpu_memory_utilization - used - peak + current) // block_bytes
+        num_blocks = max(num_blocks, 1)
 
         print(f"  KV Cache 动态分配: GPU={total/1e9:.1f}GB, "
-              f"free={free/1e6:.0f}MB, "
+              f"peak={(peak-current)/1e6:.0f}MB, "
               f"blocks={num_blocks} ({num_blocks * self.BLOCK_SIZE} tokens)")
         return num_blocks
 
