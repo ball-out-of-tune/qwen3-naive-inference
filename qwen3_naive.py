@@ -889,16 +889,14 @@ class Qwen3ForCausalLM(nn.Module):
     def _compute_num_blocks(self, gpu_memory_utilization=0.9):
         """Warmup forward → 测量激活峰值 → 计算 KV cache 可用 block 数。
 
-        公式: available = total * util - used - (peak_act)
-              num_blocks = available / block_bytes
-
-        其中 peak_act = peak - current, 即 warmup 期间除模型权重外的峰值分配。
+        用 256 tokens 做轻量 warmup (适配小显存 GPU),
+        线性外推到 2048 tokens 估算激活峰值。
         """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        # Warmup: 模拟混合 batch (~2048 tokens, 触发激活峰值)
-        warmup_tokens = min(2048, self.config.max_position_embeddings)
+        # 轻量 warmup: 256 tokens, 不撑爆小显存
+        warmup_tokens = 256
         dummy = torch.randint(0, self.config.vocab_size, (1, warmup_tokens), device='cuda')
         cu_sl = torch.tensor([0, warmup_tokens], dtype=torch.int32, device='cuda')
         pos = torch.arange(0, warmup_tokens, dtype=torch.long, device='cuda')
@@ -908,12 +906,18 @@ class Qwen3ForCausalLM(nn.Module):
             _ = self.forward(dummy)
         clear_varlen_context()
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # 释放 warmup 的激活显存
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        peak_act = peak - current  # warmup 期间的激活 + 临时 buffer 峰值
+        peak_act_256 = peak - current
+
+        # 线性外推到 chunked prefill 最大值 (2048 tokens)
+        MAX_TOKENS = 2048
+        scale = MAX_TOKENS / warmup_tokens   # 2048 / 256 = 8x
+        peak_act = int(peak_act_256 * scale)
 
         # block_bytes: 一个 block 的 K + V cache (所有层, bf16)
         attn0 = self.model.layers[0].self_attn
@@ -924,7 +928,8 @@ class Qwen3ForCausalLM(nn.Module):
         num_blocks = max(available // block_bytes, 1)
 
         print(f"  KV Cache 动态分配: GPU={total/1e9:.1f}GB, "
-              f"peak_act={peak_act/1e6:.0f}MB, "
+              f"peak_act(256)={peak_act_256/1e6:.0f}MB, "
+              f"peak_act(2048)≈{peak_act/1e6:.0f}MB, "
               f"blocks={num_blocks} ({num_blocks * self.BLOCK_SIZE} tokens)")
         return num_blocks
 

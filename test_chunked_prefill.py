@@ -83,8 +83,8 @@ def test_case1_single_chunked_vs_full(model, tokenizer, config):
 
     # === A: 非 Chunked (一次 prefill 完) ===
     clear_caches(model)
-    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
 
     seq_nc = Sequence(token_ids, {"temperature": 0.6, "max_tokens": 64})
     bm.allocate(seq_nc)
@@ -98,10 +98,16 @@ def test_case1_single_chunked_vs_full(model, tokenizer, config):
 
     print(f"  [A] 非 chunked: prefill {num_tokens} tokens 一次完成")
 
-    # === B: Chunked ===
-    clear_caches(model)
-    bm2 = BlockManager(model._num_blocks, model.BLOCK_SIZE)
-    model.allocate_global_kv_cache()
+    # === B: Chunked (复用同一 KV cache, 只清内容不重分配) ===
+    # 通过 bm.deallocate 归还 seq_nc 的 blocks, 然后重用 cache
+    bm.deallocate(seq_nc.block_table)
+    bm2 = bm  # 复用同一个 BlockManager
+    # 清空 cache 内容 (置零), 重置 free 列表
+    bm2.free = list(range(model._num_blocks))
+    bm2.ref_count = [0] * model._num_blocks
+    bm2.hash_to_block.clear()
+    bm2.block_hash = [-1] * model._num_blocks
+    bm2.block_tokens = [None] * model._num_blocks
 
     seq_c = Sequence(token_ids, {"temperature": 0.6, "max_tokens": 64})
     bm2.allocate(seq_c)
