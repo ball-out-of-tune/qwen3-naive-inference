@@ -109,8 +109,8 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.status = "WAITING"       # WAITING → RUNNING → FINISHED
         self.block_table = []         # 页表: [3, 7, 12] — 逻辑块→物理块
-        self.cached_len = 0           # 已写入 KV cache 的 token 数量
-        self.num_cached_tokens = 0   # 前缀有多少 token 已在 cache 里 (prefix caching)
+        self.kv_len = 0                # 已写入 KV cache 的 token 数 (含 prefix cache + prefill + decode)
+        self.num_scheduled_tokens = 0 # 本轮要计算的 token 数 (prefill chunk 或 decode=1)
         sp = sampling_params or {}
         self.temperature = sp.get("temperature", 0.6)
         self.max_tokens = sp.get("max_tokens", 256)
@@ -215,7 +215,7 @@ class BlockManager:
             self.ref_count[blk] = 1
             seq.block_table.append(blk)
 
-        seq.num_cached_tokens = num_cached * self.block_size
+        seq.kv_len = num_cached * self.block_size
 
     # ================================================================
     # deallocate: ref_count--, 降到 0 归还 free (但保留 hash 供复用!)
@@ -252,14 +252,23 @@ class BlockManager:
     # hash_blocks: prefill 完成后注册满 block 的 hash
     # ================================================================
     def hash_blocks(self, seq: Sequence):
-        """prefill 后把完整写入的 block 注册到 hash 表。"""
-        full_blocks = seq.num_prompt_tokens // self.block_size
-        start = seq.num_cached_tokens // self.block_size
+        """prefill 后把本轮写入的 block 注册到 hash 表。
+
+        使用 seq.kv_len (本轮后) - seq.num_scheduled_tokens (本轮前) 确定边界，
+        对于 decode (num_scheduled_tokens=0 或仅有尾部不满 block) 则跳过。"""
+        old_kv_len = seq.kv_len - seq.num_scheduled_tokens
+        start_block = old_kv_len // self.block_size
+        end_block = seq.kv_len // self.block_size
+        # 对 prefill chunk: hash 所有本轮完整写入的 block
+        # 对 decode: 通常不跨 block, start==end, 跳过
+
+        if start_block >= end_block:
+            return
 
         # 找链式起点: 前一个 block 的 hash (可能来自共享或之前注册的)
-        h = self.block_hash[seq.block_table[start - 1]] if start > 0 else -1
+        h = self.block_hash[seq.block_table[start_block - 1]] if start_block > 0 else -1
 
-        for i in range(start, full_blocks):
+        for i in range(start_block, end_block):
             blk = seq.block_table[i]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
@@ -536,13 +545,9 @@ class Qwen3Attention(nn.Module):
             k_flat[block_mapping] = k
             v_flat[block_mapping] = v
 
-        # 有前缀缓存: 传整个 cache (含刚写入的 K/V), flash_attn 通过 block_tables 寻址
-        if block_tables is not None:
-            k = self.k_cache
-            v = self.v_cache
-
+        # 始终从 cache 读 (含刚写入的 K/V), flash_attn 通过 block_tables 寻址
         o = flash_attn_varlen_func(
-            q, k, v,
+            q, self.k_cache, self.v_cache,
             max_seqlen_q=max_seqlen_q, cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=max_seqlen_k, cu_seqlens_k=cu_seqlens_k,
             softmax_scale=self.scale, causal=True,
@@ -905,35 +910,37 @@ class Qwen3ForCausalLM(nn.Module):
             layer.self_attn.k_cache = k[i]
             layer.self_attn.v_cache = v[i]
 
-    def _prepare_prefill(self, seqs: list[Sequence]):
-        """构建 varlen prefill 输入和 block_mapping。
-        支持 prefix caching: 只 prefill 新 token, 缓存前缀通过 block_tables 读。
+    def _prepare_step(self, seqs: list[Sequence]):
+        """统一准备混合 batch (prefill chunk + decode): 构建 varlen 输入和 block_mapping。
+
+        对每条序列, 从 kv_len 开始取 num_scheduled_tokens 个 token 作为本轮计算量。
+        decode: num_scheduled_tokens=1, 取 1 个新 token 的 input_id
+        prefill chunk: num_scheduled_tokens=N, 取 N 个 prompt token
 
         返回: (input_ids, positions, cu_seqlens_q, cu_seqlens_k,
                max_seqlen_q, max_seqlen_k, block_mapping, block_tables)
         """
         input_ids, positions = [], []
-        cu_seqlens_q = [0]      # 新 token 累积长度
-        cu_seqlens_k = [0]      # 全部 token 累积长度 (含缓存前缀)
+        cu_seqlens_q = [0]      # 新 token 累积长度 (只含本轮要算的)
+        cu_seqlens_k = [0]      # 全部 token 累积长度 (含缓存前缀 + 本轮新 token)
         max_seqlen_q = 0
         max_seqlen_k = 0
         block_mapping = []
-        has_prefix = any(s.num_cached_tokens > 0 for s in seqs)
 
         for seq in seqs:
-            start = seq.num_cached_tokens       # 跳过已缓存的 token
-            L = seq.num_prompt_tokens           # 总 prompt 长度
-            new_tokens = L - start               # 需要 prefill 的新 token 数
+            start = seq.kv_len                        # 下一个要算的位置
+            end = start + seq.num_scheduled_tokens     # 本轮算几个
+            new_tokens = end - start
 
-            input_ids.extend(seq.token_ids[start:L])
-            positions.extend(range(start, L))   # 位置从 start 继续
+            input_ids.extend(seq.token_ids[start:end])
+            positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + new_tokens)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + L)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + end)  # kv_len + new_tokens
             max_seqlen_q = max(max_seqlen_q, new_tokens)
-            max_seqlen_k = max(max_seqlen_k, L)
+            max_seqlen_k = max(max_seqlen_k, end)
 
-            # 只为新 token 构建 block_mapping (写入 cache)
-            for pos in range(start, L):
+            # 为新 token 构建 block_mapping (写入 cache)
+            for pos in range(start, end):
                 blk = seq.block_table[pos // self.BLOCK_SIZE]
                 off = pos % self.BLOCK_SIZE
                 block_mapping.append(blk * self.BLOCK_SIZE + off)
@@ -945,10 +952,8 @@ class Qwen3ForCausalLM(nn.Module):
         cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
         blk_map = torch.tensor(block_mapping, dtype=torch.int32, device=device)
 
-        if has_prefix:
-            block_tables = self._build_block_tables(seqs)
-        else:
-            block_tables = None
+        # 始终构建 block_tables (混合 batch 必须, decode-only 也必须)
+        block_tables = self._build_block_tables(seqs)
 
         return input_ids, positions, cu_q, cu_k, max_seqlen_q, max_seqlen_k, blk_map, block_tables
 
@@ -961,11 +966,11 @@ class Qwen3ForCausalLM(nn.Module):
         return bt
 
     def _prepare_decode(self, seqs: list[Sequence]):
-        """构建 decode 输入：block_tables 用于 flash_attn 寻址"""
+        """构建 decode 输入：block_tables 用于 flash_attn 寻址 (仅用于 decode-only batch)"""
         device = 'cuda'
         input_ids = torch.tensor([s.last_token for s in seqs], dtype=torch.long, device=device)
         positions = torch.tensor([s.num_tokens - 1 for s in seqs], dtype=torch.long, device=device)
-        context_lens = torch.tensor([s.cached_len for s in seqs], dtype=torch.int32, device=device)
+        context_lens = torch.tensor([s.kv_len for s in seqs], dtype=torch.int32, device=device)
 
         # block_tables: [batch, max_blocks]  短序列填 -1
         max_blocks = max(len(s.block_table) for s in seqs)
@@ -979,9 +984,14 @@ class Qwen3ForCausalLM(nn.Module):
     def generate_continuous(self, prompt_ids_list, max_new_tokens=256,
                             temperature=0.6, top_k=20, eos_token_ids=None):
         """
-        Continuous Batching: 序列可以随时加入，完成的序列即时退出。
-        简化版策略：优先 prefill 所有 waiting，再 decode 所有 running。
+        Continuous Batching + Chunked Prefill: 序列随时加入/退出,
+        prefill 和 decode 可在同一个 batch 中混合执行。
+
+        调度策略: 先遍历 running (decode 优先, 每条 1 token; mid-prefill 继续吃预算),
+                 再用剩余 budget 拉 waiting (切 chunk)。
         """
+        MAX_TOKENS_PER_STEP = 2048
+
         bm = BlockManager(self.NUM_BLOCKS, self.BLOCK_SIZE)
         self.allocate_global_kv_cache()
 
@@ -995,63 +1005,122 @@ class Qwen3ForCausalLM(nn.Module):
         all_seqs = list(waiting)  # 保留引用，最终用来取结果
 
         while waiting or running:
-            # ---- Scheduler: 优先 prefill，有空闲块就接新请求 ----
-            pref_seqs: list[Sequence] = []
-            while waiting:
-                seq = waiting[0]
-                # 先分配块，不够就不拉进来
-                needed = seq.num_blocks
-                if bm.available < needed:
-                    break
-                bm.allocate(seq)
-                waiting.pop(0)
-                seq.status = "RUNNING"
-                running.append(seq)
-                pref_seqs.append(seq)
+            all_scheduled = []
+            budget = MAX_TOKENS_PER_STEP
 
-            if pref_seqs:
-                # ---- Prefill ----
-                input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, bt = self._prepare_prefill(pref_seqs)
-                h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, bt)
-                logits = self.lm_head(h)
+            # ============================================================
+            # Step 1: 遍历 running — decode 优先，mid-prefill 继续吃预算
+            # ============================================================
+            i = 0
+            while i < len(running) and budget > 0:
+                seq = running[i]
 
-                # 关键：prefill 完成后，整个 prompt 已经写进 KV cache
-                for seq in pref_seqs:
-                    seq.cached_len = seq.num_prompt_tokens
-                    bm.hash_blocks(seq)          # 注册 block hash，供后续序列复用
+                if seq.kv_len >= seq.num_prompt_tokens:
+                    # ── DECODE 序列 ──
+                    # 检查是否到达 max_tokens (采样后才追加，这里预判)
+                    if seq.num_completion_tokens >= seq.max_tokens:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.pop(i)
+                        continue
 
-                # 取每条序列最后一个 token 的 logit
-                last_logits = torch.stack([
-                    logits[cu_q[i + 1] - 1] for i in range(len(pref_seqs))
-                ])
-                seqs_step = pref_seqs
-                is_prefill_step = True
-            else:
-                # ---- Decode ----
-                # 检查哪些序列需要追加块（deocde 越过 256 边界）
-                for seq in list(running):
                     if not bm.can_append(seq):
-                        # 没有空闲块 → 驱逐
+                        # 没有空闲块 → 驱逐回 waiting
                         seq.status = "WAITING"
                         bm.deallocate(seq.block_table)
                         seq.block_table.clear()
-                        seq.cached_len = 0
-                        running.remove(seq)
+                        seq.kv_len = 0   # 块全释放，cache 清零
+                        running.pop(i)
                         waiting.insert(0, seq)
-                    else:
-                        bm.may_append(seq)
+                        continue
 
-                if not running:
-                    # 全部被驱逐了
-                    continue
+                    bm.may_append(seq)
+                    seq.num_scheduled_tokens = 1
+                else:
+                    # ── MID-PREFILL 序列 ──
+                    # blocks 在 allocate() 时已经全部分配好了，不需要 can_append
+                    remaining = seq.num_prompt_tokens - seq.kv_len
+                    seq.num_scheduled_tokens = min(remaining, budget)
 
-                input_ids, pos, ctx_lens, block_tables = self._prepare_decode(running)
+                all_scheduled.append(seq)
+                budget -= seq.num_scheduled_tokens
+                i += 1
+
+            # ============================================================
+            # Step 2: 用剩余 budget 拉 waiting → 分配 blocks → 切 chunk
+            # ============================================================
+            while waiting and budget > 0:
+                seq = waiting[0]
+
+                if not seq.block_table:
+                    # 首次分配 blocks (prefix cache 命中会设 kv_len)
+                    if bm.available < seq.num_blocks:
+                        break
+                    bm.allocate(seq)
+
+                waiting.pop(0)
+                seq.status = "RUNNING"
+                running.append(seq)
+
+                remaining = seq.num_prompt_tokens - seq.kv_len
+                if remaining <= budget:
+                    seq.num_scheduled_tokens = remaining   # 一次 prefill 完
+                elif len(all_scheduled) == 0:
+                    seq.num_scheduled_tokens = budget      # 第一条, 切 chunk
+                else:
+                    # 已有其他 seq，留给下一步
+                    waiting.insert(0, seq)
+                    running.pop()
+                    break
+
+                all_scheduled.append(seq)
+                budget -= seq.num_scheduled_tokens
+
+            if not all_scheduled:
+                continue
+
+            # ============================================================
+            # Step 3: Forward — 选路径
+            # ============================================================
+            all_decode = all(s.num_scheduled_tokens == 1 for s in all_scheduled)
+
+            if all_decode:
+                # decode-only: 用 flash_attn_with_kvcache 优化路径
+                input_ids, pos, ctx_lens, block_tables = self._prepare_decode(all_scheduled)
                 h = self.model.forward_decode(input_ids, pos, ctx_lens, block_tables)
-                last_logits = self.lm_head(h)
-                seqs_step = running
-                is_prefill_step = False
+            else:
+                # 混合 batch 或 prefill-only: 统一 varlen 路径
+                input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables = self._prepare_step(all_scheduled)
+                h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables)
 
-            # ---- 采样 ----
+            logits = self.lm_head(h)
+
+            # ============================================================
+            # Step 4: 更新 kv_len + hash blocks
+            # ============================================================
+            for seq in all_scheduled:
+                seq.kv_len += seq.num_scheduled_tokens
+                bm.hash_blocks(seq)
+
+            # ============================================================
+            # Step 5: 条件采样 — 仅 prefill 完成 或 decode
+            # ============================================================
+            sample_indices = []
+            offset = 0
+            for seq in all_scheduled:
+                if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
+                    sample_indices.append(offset + seq.num_scheduled_tokens - 1)
+                offset += seq.num_scheduled_tokens
+
+            if sample_indices:
+                last_logits = logits[sample_indices].float()
+            else:
+                # 所有 seq 都是 mid-prefill, 不采样
+                for seq in all_scheduled:
+                    seq.num_scheduled_tokens = 0
+                continue
+
             last_logits = last_logits / temperature
             if top_k is not None:
                 topk_vals, topk_idx = torch.topk(last_logits, top_k, dim=-1)
@@ -1060,27 +1129,28 @@ class Qwen3ForCausalLM(nn.Module):
                 last_logits = filtered.scatter(-1, topk_idx, topk_vals)
 
             probs = torch.softmax(last_logits, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1)   # [N, 1]
+            next_tokens = torch.multinomial(probs, num_samples=1)   # [N_sample, 1]
 
-            # ---- 更新序列状态 ----
-            for i, seq in enumerate(seqs_step):
-                token_id = next_tokens[i].item()
-                seq.append_token(token_id)
-                if not is_prefill_step:
-                    # decode 步：K/V 刚刚在 forward_decode 里写入了 cache，所以 +1
-                    seq.cached_len += 1
-                # prefill 步：新 token 的 K/V 还没算，第一次 decode 才会算它
+            # ---- 更新采样后的序列状态 ----
+            sample_idx = 0
+            for seq in all_scheduled:
+                if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
+                    token_id = next_tokens[sample_idx].item()
+                    seq.append_token(token_id)
+                    sample_idx += 1
 
-                if eos_token_ids is not None and token_id in eos_token_ids:
-                    seq.status = "FINISHED"
-                    bm.deallocate(seq.block_table)
-                    seq.block_table.clear()
-                    running.remove(seq)
-                elif seq.num_completion_tokens >= seq.max_tokens:
-                    seq.status = "FINISHED"
-                    bm.deallocate(seq.block_table)
-                    seq.block_table.clear()
-                    running.remove(seq)
+                    if eos_token_ids is not None and token_id in eos_token_ids:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.remove(seq)
+                    elif seq.num_completion_tokens >= seq.max_tokens:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.remove(seq)
+
+                seq.num_scheduled_tokens = 0   # reset
 
         # 返回结果
         results = [(s.token_ids, s.token_ids[s.num_prompt_tokens:]) for s in all_seqs]

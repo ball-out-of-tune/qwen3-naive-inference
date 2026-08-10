@@ -4,7 +4,7 @@ Prefix Caching 验证
 测试流程:
   1. 第一批: prefill 4 条 prompt → hash_blocks 注册
   2. 第二批: 第 5 条 prompt, 前缀和第 1 条完全一样
-     → 验证前缀命中 (num_cached_tokens > 0)
+     → 验证前缀命中 (kv_len > 0)
      → 验证只 prefill 新 token (cu_seqlens_q < cu_seqlens_k)
      → 对比: prefix-cached prefill vs 完整 forward (都对同一条 seq5)
 """
@@ -110,7 +110,7 @@ def main():
 
     for s in seqs1:
         bm.allocate(s)
-        print(f"  seq (blocks={len(s.block_table)}, num_cached={s.num_cached_tokens})")
+        print(f"  seq (blocks={len(s.block_table)}, num_cached={s.kv_len})")
 
     input_ids1, pos1, cu_q1, cu_k1, m_q1, m_k1, blk_map1, bt1 = model._prepare_prefill(seqs1)
     print(f"\n  总 prefill token 数: {input_ids1.shape[0]}")
@@ -118,7 +118,7 @@ def main():
 
     model.model.forward_prefill(input_ids1, pos1, cu_q1, cu_k1, m_q1, m_k1, blk_map1, bt1)
     for s in seqs1:
-        s.cached_len = s.num_prompt_tokens
+        s.kv_len = s.num_prompt_tokens
         bm.hash_blocks(s)
 
     print(f"  注册后 hash_to_block 有 {len(bm.hash_to_block)} 个条目")
@@ -131,14 +131,14 @@ def main():
     print(f"{'='*60}")
 
     seq5 = Sequence(ids5[0].tolist(), {"temperature": 0.6, "max_tokens": 64})
-    print(f"  allocate 前: block_table={seq5.block_table}, num_cached={seq5.num_cached_tokens}")
+    print(f"  allocate 前: block_table={seq5.block_table}, num_cached={seq5.kv_len}")
 
     bm.allocate(seq5)
 
     print(f"  allocate 后: block_table={seq5.block_table}")
-    print(f"  num_cached_tokens={seq5.num_cached_tokens}")
-    print(f"  共享的 block: {seq5.num_cached_tokens // model.BLOCK_SIZE}")
-    print(f"  新 block: {len(seq5.block_table) - seq5.num_cached_tokens // model.BLOCK_SIZE}")
+    print(f"  kv_len={seq5.kv_len}")
+    print(f"  共享的 block: {seq5.kv_len // model.BLOCK_SIZE}")
+    print(f"  新 block: {len(seq5.block_table) - seq5.kv_len // model.BLOCK_SIZE}")
 
     # ================================================================
     # 第四步: 比对 prefix-cached prefill vs 完整 forward
@@ -148,7 +148,7 @@ def main():
     print(f"{'='*60}")
 
     input_ids5, pos5, cu_q5, cu_k5, m_q5, m_k5, blk_map5, bt5 = model._prepare_prefill([seq5])
-    print(f"  input_ids: {input_ids5.shape[0]} tokens (总共{seq5.num_prompt_tokens}, 缓存{seq5.num_cached_tokens})")
+    print(f"  input_ids: {input_ids5.shape[0]} tokens (总共{seq5.num_prompt_tokens}, 缓存{seq5.kv_len})")
     print(f"  cu_q (新token): {cu_q5.tolist()}")
     print(f"  cu_k (含缓存):   {cu_k5.tolist()}")
     print(f"  cu_k > cu_q: {cu_k5[-1].item() > cu_q5[-1].item()}")
@@ -174,7 +174,7 @@ def main():
     l2_dist = torch.norm(last_logits_full - last_logits_cached, p=2).item()
     l2_rel = l2_dist / torch.norm(last_logits_full, p=2).item()
 
-    print(f"  prefix 命中: {seq5.num_cached_tokens > 0} ({seq5.num_cached_tokens} tokens)")
+    print(f"  prefix 命中: {seq5.kv_len > 0} ({seq5.kv_len} tokens)")
     print(f"  cu_k > cu_q: {cu_k5[-1].item() > cu_q5[-1].item()}")
     print(f"  top-1 一致: {top1_match}")
     print(f"    full: {ref_topk[0].item()} → '{tokenizer.decode([ref_topk[0].item()])}'")
@@ -184,12 +184,12 @@ def main():
 
     # 验证 ref_count
     print(f"\n  引用计数:")
-    shared_blocks = seq5.num_cached_tokens // model.BLOCK_SIZE
+    shared_blocks = seq5.kv_len // model.BLOCK_SIZE
     for i in range(shared_blocks):
         bid = seq5.block_table[i]
         print(f"    block[{i}]={bid}: ref_count={bm.ref_count[bid]} (应为2: seq1+seq5)")
 
-    if seq5.num_cached_tokens > 0 and cu_k5[-1].item() > cu_q5[-1].item() and top1_match and overlap >= 15:
+    if seq5.kv_len > 0 and cu_k5[-1].item() > cu_q5[-1].item() and top1_match and overlap >= 15:
         print(f"\n  ✅ PASS — Prefix Caching 工作正常!")
         ok = True
     else:
