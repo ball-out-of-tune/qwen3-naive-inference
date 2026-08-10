@@ -557,14 +557,15 @@ class Qwen3Attention(nn.Module):
         o = o.view(tokens, -1)
         return self.o_proj(o)
 
-    def forward_decode(self, x, positions, context_lens, block_tables):
+    def forward_decode(self, x, positions, context_lens, block_tables, slot_mapping=None):
         """
         Decode: 每个序列只算 1 个新 token，从全局 cache 读历史 K/V。
 
-        x:            [batch, hidden]   batch 条序列，各 1 个 token
-        positions:    [batch]           每个新 token 的绝对位置
-        context_lens: [batch]           每个序列已缓存的 K/V 数量（写新 token 前）
-        block_tables: [batch, max_blocks] 页表，-1 填充
+        x:             [batch, hidden]   batch 条序列，各 1 个 token
+        positions:     [batch]           每个新 token 的绝对位置
+        context_lens:  [batch]           每个序列已缓存的 K/V 数量（写新 token 前）
+        block_tables:  [batch, max_blocks] 页表，-1 填充
+        slot_mapping:  [batch]           每个新 token 写入 cache 的物理地址 (可选, CUDA Graph 用)
         """
         batch = x.shape[0]
 
@@ -581,17 +582,21 @@ class Qwen3Attention(nn.Module):
 
         q, k_new = self.rotary_emb(q, k_new, positions)
 
-        # 把新 K/V 写入全局 cache（查页表找物理地址）
+        # 把新 K/V 写入全局 cache: 纯 tensor 索引, 可用于 CUDA Graph
         if self.k_cache.numel():
             k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
             v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
-            for i in range(batch):
-                pos = context_lens[i].item()                # 新 token 的逻辑位置
-                blk = block_tables[i, pos // 256].item()    # 查页表
-                off = pos % 256
-                idx = blk * 256 + off
-                k_flat[idx] = k_new[i]
-                v_flat[idx] = v_new[i]
+            if slot_mapping is not None:
+                k_flat[slot_mapping] = k_new
+                v_flat[slot_mapping] = v_new
+            else:
+                for i in range(batch):
+                    pos = context_lens[i].item()
+                    blk = block_tables[i, pos // 256].item()
+                    off = pos % 256
+                    idx = blk * 256 + off
+                    k_flat[idx] = k_new[i]
+                    v_flat[idx] = v_new[i]
 
         # flash_attn 从 cache 读历史 K/V（靠 block_table 寻址）
         o = flash_attn_with_kvcache(
@@ -657,9 +662,9 @@ class Qwen3DecoderLayer(nn.Module):
         x = self.mlp(self.post_attention_layernorm(x)) + x
         return x
 
-    def forward_decode(self, x, positions, context_lens, block_tables):
+    def forward_decode(self, x, positions, context_lens, block_tables, slot_mapping=None):
         x = self.self_attn.forward_decode(
-            self.input_layernorm(x), positions, context_lens, block_tables,
+            self.input_layernorm(x), positions, context_lens, block_tables, slot_mapping,
         ) + x
         x = self.mlp(self.post_attention_layernorm(x)) + x
         return x
@@ -702,10 +707,10 @@ class Qwen3Model(nn.Module):
         h = self.norm(h)
         return h
 
-    def forward_decode(self, x, positions, context_lens, block_tables):
+    def forward_decode(self, x, positions, context_lens, block_tables, slot_mapping=None):
         h = self.embed_tokens(x)
         for layer in self.layers:
-            h = layer.forward_decode(h, positions, context_lens, block_tables)
+            h = layer.forward_decode(h, positions, context_lens, block_tables, slot_mapping)
         h = self.norm(h)
         return h
 
@@ -952,6 +957,84 @@ class Qwen3ForCausalLM(nn.Module):
             layer.self_attn.k_cache = k[i]
             layer.self_attn.v_cache = v[i]
 
+    # ===================== CUDA Graph (decode 加速) =====================
+
+    def _init_cuda_graphs(self):
+        """预分配 CUDA Graph buffer tensors + 捕获各 batch size 的图。
+
+        所有图共享一个 memory pool, 避免显存爆炸。
+        录制 batch sizes: [1, 2, 4, 8, 16, 32, 48, 64]
+        """
+        max_bs = 64
+        max_blocks = (self.config.max_position_embeddings + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
+        hidden = self.config.hidden_size
+
+        self._graph_bufs = {
+            "input_ids":    torch.zeros(max_bs, dtype=torch.long,       device='cuda'),
+            "positions":    torch.zeros(max_bs, dtype=torch.long,       device='cuda'),
+            "slot_mapping": torch.zeros(max_bs, dtype=torch.int32,      device='cuda'),
+            "context_lens": torch.zeros(max_bs, dtype=torch.int32,      device='cuda'),
+            "block_tables": torch.zeros(max_bs, max_blocks, dtype=torch.int32, device='cuda'),
+            "outputs":      torch.zeros(max_bs, hidden, dtype=torch.bfloat16, device='cuda'),
+        }
+        self._graphs = {}
+        self._graph_pool = None
+        self._graph_bs = [1, 2, 4, 8, 16, 32, 48, 64]
+        self._has_cuda_graphs = False
+
+    def _capture_decode_graphs(self):
+        """为每个 batch size 录制 CUDA Graph (decode-only)。
+
+        先 warmup 一次触发 lazy init, 再录制。所有图复用同一个 memory pool。
+        """
+        if torch.cuda.is_available():
+            try:
+                bufs = self._graph_bufs
+                num_blocks = getattr(self, '_num_blocks', 0)
+                max_bt = bufs["block_tables"].shape[1]
+
+                for bs in reversed(self._graph_bs):
+                    # warmup: 触达所有 lazy 初始化
+                    self.model.forward_decode(
+                        bufs["input_ids"][:bs], bufs["positions"][:bs],
+                        bufs["context_lens"][:bs], bufs["block_tables"][:bs, :min(num_blocks, max_bt)],
+                        bufs["slot_mapping"][:bs],
+                    )
+                    graph = torch.cuda.CUDAGraph()
+                    bt_cols = min(num_blocks, max_bt) if num_blocks > 0 else max_bt
+                    with torch.cuda.graph(graph, pool=self._graph_pool):
+                        bufs["outputs"][:bs] = self.model.forward_decode(
+                            bufs["input_ids"][:bs], bufs["positions"][:bs],
+                            bufs["context_lens"][:bs], bufs["block_tables"][:bs, :bt_cols],
+                            bufs["slot_mapping"][:bs],
+                        )
+                    if self._graph_pool is None:
+                        self._graph_pool = graph.pool()
+                    self._graphs[bs] = graph
+
+                self._has_cuda_graphs = True
+                print(f"  CUDA Graph: 捕获 {len(self._graphs)} 个图 "
+                      f"(bs={self._graph_bs})")
+            except Exception as e:
+                print(f"  CUDA Graph 捕获失败, 回退到 eager 模式: {e}")
+                self._has_cuda_graphs = False
+
+    def _run_decode_graph(self, bs, input_ids, positions, context_lens,
+                          block_tables, slot_mapping):
+        """用 CUDA Graph 执行 decode: 拷贝输入 → replay → 返回输出"""
+        graph_bs = next((x for x in self._graph_bs if x >= bs), None)
+        if graph_bs is None:
+            return None
+
+        bufs = self._graph_bufs
+        bufs["input_ids"][:bs] = input_ids
+        bufs["positions"][:bs] = positions
+        bufs["slot_mapping"][:bs] = slot_mapping
+        bufs["context_lens"][:bs] = context_lens
+        bufs["block_tables"][:bs, :block_tables.shape[1]] = block_tables
+        self._graphs[graph_bs].replay()
+        return bufs["outputs"][:bs].clone()
+
     def _prepare_step(self, seqs: list[Sequence]):
         """统一准备混合 batch (prefill chunk + decode): 构建 varlen 输入和 block_mapping。
 
@@ -1008,7 +1091,7 @@ class Qwen3ForCausalLM(nn.Module):
         return bt
 
     def _prepare_decode(self, seqs: list[Sequence]):
-        """构建 decode 输入：block_tables 用于 flash_attn 寻址 (仅用于 decode-only batch)"""
+        """构建 decode 输入：block_tables + slot_mapping 用于 flash_attn + CUDA Graph"""
         device = 'cuda'
         input_ids = torch.tensor([s.last_token for s in seqs], dtype=torch.long, device=device)
         positions = torch.tensor([s.num_tokens - 1 for s in seqs], dtype=torch.long, device=device)
@@ -1020,7 +1103,16 @@ class Qwen3ForCausalLM(nn.Module):
         for i, s in enumerate(seqs):
             bt[i, :len(s.block_table)] = torch.tensor(s.block_table, dtype=torch.int32, device=device)
 
-        return input_ids, positions, context_lens, bt
+        # slot_mapping: 每个新 token 写入 cache 的物理地址
+        slot_mapping = []
+        for s in seqs:
+            pos = s.kv_len
+            blk = s.block_table[pos // self.BLOCK_SIZE]
+            off = pos % self.BLOCK_SIZE
+            slot_mapping.append(blk * self.BLOCK_SIZE + off)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=device)
+
+        return input_ids, positions, context_lens, bt, slot_mapping
 
     @torch.no_grad()
     def generate_continuous(self, prompt_ids_list, max_new_tokens=256,
@@ -1036,6 +1128,10 @@ class Qwen3ForCausalLM(nn.Module):
 
         bm = BlockManager(self._num_blocks, self.BLOCK_SIZE)
         self.allocate_global_kv_cache()
+
+        # 初始化 CUDA Graph (decode 加速)
+        self._init_cuda_graphs()
+        self._capture_decode_graphs()
 
         # 用 prompt_ids_list 创建 Sequence
         waiting: list[Sequence] = []
@@ -1128,9 +1224,19 @@ class Qwen3ForCausalLM(nn.Module):
             all_decode = all(s.num_scheduled_tokens == 1 for s in all_scheduled)
 
             if all_decode:
-                # decode-only: 用 flash_attn_with_kvcache 优化路径
-                input_ids, pos, ctx_lens, block_tables = self._prepare_decode(all_scheduled)
-                h = self.model.forward_decode(input_ids, pos, ctx_lens, block_tables)
+                # decode-only: 优先 CUDA Graph, 回退到 eager
+                input_ids, pos, ctx_lens, block_tables, slot_mapping = self._prepare_decode(all_scheduled)
+                bs = len(all_scheduled)
+                h = None
+                if self._has_cuda_graphs:
+                    h = self._run_decode_graph(
+                        bs, input_ids, pos, ctx_lens,
+                        block_tables, slot_mapping,
+                    )
+                if h is None:
+                    h = self.model.forward_decode(
+                        input_ids, pos, ctx_lens, block_tables, slot_mapping,
+                    )
             else:
                 # 混合 batch 或 prefill-only: 统一 varlen 路径
                 input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables = self._prepare_step(all_scheduled)

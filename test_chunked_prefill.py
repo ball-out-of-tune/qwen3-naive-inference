@@ -1,10 +1,11 @@
 """
-Chunked Prefill 验证
+Chunked Prefill + CUDA Graph 验证
 
 核心测试:
   Case 1: 单条长 prompt 分 chunk, logits vs 非 chunked (同路径对比) — 正确性基石
   Case 3: kv_len 跨 step 正确 (mid-prefill 继续)
   Case 4: 混合 batch (decode + prefill chunk) 不炸
+  Case 5: CUDA Graph decode 端到端 — 正常生成不报错
 """
 
 import torch
@@ -329,6 +330,48 @@ def test_case4_mixed_batch(model, tokenizer, config):
     return all_ok
 
 
+def test_case5_cuda_graph(model, tokenizer, config):
+    """Case 5: CUDA Graph decode 端到端 — 正常生成不报错"""
+    print(f"\n{'='*60}")
+    print("Case 5: CUDA Graph — decode 端到端")
+    print(f"{'='*60}")
+
+    clear_caches(model)
+    torch.cuda.empty_cache()
+
+    # 2 条短 prompt, 确保大部分 step 走 decode
+    prompts = ["你好，请介绍一下你自己。", "今天天气怎么样？"]
+    prompt_ids_list = []
+    for text in prompts:
+        messages = [{"role": "user", "content": text}]
+        formatted = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        ids = tokenizer.encode(formatted, return_tensors="pt").to("cuda")
+        prompt_ids_list.append(ids)
+        print(f"  prompt: {ids.shape[1]} tokens")
+
+    # 用 generate_continuous, max_new_tokens 设小一点
+    torch.manual_seed(42)
+    seq_tokens, all_generated = model.generate_continuous(
+        prompt_ids_list,
+        max_new_tokens=16,
+        temperature=0.6,
+        top_k=20,
+        eos_token_ids=[config.eos_token_id],
+    )
+
+    has_graph = getattr(model, '_has_cuda_graphs', False)
+    print(f"\n  CUDA Graph 已捕获: {has_graph}")
+    print(f"  生成 token 数: {[len(g) for g in all_generated]}")
+
+    # 只要不报错就跑通了
+    total_generated = sum(len(g) for g in all_generated)
+    passed = total_generated > 0
+    print(f"  {'✅ PASS' if passed else '❌ FAIL'} — Case 5")
+    return passed
+
+
 def run_case(case_num):
     """跑单个 case, 完成后彻底清理显存"""
     model, tokenizer, config = load_model_and_tokenizer()
@@ -340,6 +383,8 @@ def run_case(case_num):
             ok = test_case3_kvlen_tracking(model, tokenizer, config)
         elif case_num == 4:
             ok = test_case4_mixed_batch(model, tokenizer, config)
+        elif case_num == 5:
+            ok = test_case5_cuda_graph(model, tokenizer, config)
         else:
             print(f"未知 case: {case_num}")
             return False
@@ -372,7 +417,7 @@ def main():
         # 全部跑: 每个 case 独立进程, 干净显存
         import subprocess, os
         results = {}
-        for cn in [1, 3, 4]:
+        for cn in [1, 3, 4, 5]:
             print(f"\n{'#'*60}")
             print(f"# 启动独立进程跑 Case {cn}")
             print(f"{'#'*60}")
