@@ -98,8 +98,8 @@ def main():
     # 第二步: 第一批 prefill 4 条 → 注册 hash
     # ================================================================
     clear_caches(model)
-    bm = BlockManager(model.NUM_BLOCKS, model.BLOCK_SIZE)
-    model.allocate_global_kv_cache()
+    model.allocate_global_kv_cache()  # 触发 warmup, 设置 _num_blocks
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
 
     print(f"\n{'='*60}")
     print("第一批: prefill 4 条 prompt + 注册 hash")

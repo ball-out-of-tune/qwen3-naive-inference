@@ -31,7 +31,7 @@ def load_model_and_tokenizer():
     print(f"参数: {params:,}  |  VRAM: {vram:.2f} GB")
 
     # 4 GiB GPU 显存紧张，block 数减到 24 (KV cache ~700 MB)
-    model.NUM_BLOCKS = 24
+    model._num_blocks = 24
     return model, tokenizer, config
 
 
@@ -83,7 +83,7 @@ def test_case1_single_chunked_vs_full(model, tokenizer, config):
 
     # === A: 非 Chunked (一次 prefill 完) ===
     clear_caches(model)
-    bm = BlockManager(model.NUM_BLOCKS, model.BLOCK_SIZE)
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
 
     seq_nc = Sequence(token_ids, {"temperature": 0.6, "max_tokens": 64})
@@ -100,7 +100,7 @@ def test_case1_single_chunked_vs_full(model, tokenizer, config):
 
     # === B: Chunked ===
     clear_caches(model)
-    bm2 = BlockManager(model.NUM_BLOCKS, model.BLOCK_SIZE)
+    bm2 = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
 
     seq_c = Sequence(token_ids, {"temperature": 0.6, "max_tokens": 64})
@@ -156,7 +156,7 @@ def test_case3_kvlen_tracking(model, tokenizer, config):
     print(f"{'='*60}")
 
     clear_caches(model)
-    bm = BlockManager(model.NUM_BLOCKS, model.BLOCK_SIZE)
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
 
     # 使用较短 prompt (~1500 tokens) + 小 chunk(512), 适配 4 GiB 卡
@@ -226,7 +226,7 @@ def test_case4_mixed_batch(model, tokenizer, config):
     print(f"{'='*60}")
 
     clear_caches(model)
-    bm = BlockManager(model.NUM_BLOCKS, model.BLOCK_SIZE)
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
 
     # 2 条短 prompt, 1 条长 prompt

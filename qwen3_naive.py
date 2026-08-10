@@ -715,6 +715,7 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
+        self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -883,27 +884,75 @@ class Qwen3ForCausalLM(nn.Module):
 
     # ===================== Continuous Batching =====================
 
-    NUM_BLOCKS = 64
     BLOCK_SIZE = 256
 
-    def allocate_global_kv_cache(self):
-        """分配全局 KV cache：[layers, num_blocks, block_size, kv_heads, dim]
-        如果已分配过相同形状则跳过，避免重复分配 OOM。"""
-        # 检查是否已经分配过正确形状的 cache
+    def _compute_num_blocks(self, gpu_memory_utilization=0.9):
+        """Warmup forward → 测量激活峰值 → 计算 KV cache 可用 block 数。
+
+        公式: available = total * util - used - (peak_act)
+              num_blocks = available / block_bytes
+
+        其中 peak_act = peak - current, 即 warmup 期间除模型权重外的峰值分配。
+        """
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        # Warmup: 模拟混合 batch (~2048 tokens, 触发激活峰值)
+        warmup_tokens = min(2048, self.config.max_position_embeddings)
+        dummy = torch.randint(0, self.config.vocab_size, (1, warmup_tokens), device='cuda')
+        cu_sl = torch.tensor([0, warmup_tokens], dtype=torch.int32, device='cuda')
+        pos = torch.arange(0, warmup_tokens, dtype=torch.long, device='cuda')
+
+        set_varlen_context(cu_sl, cu_sl, warmup_tokens, warmup_tokens, pos)
+        with torch.no_grad():
+            _ = self.forward(dummy)
+        clear_varlen_context()
+        torch.cuda.synchronize()
+
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        peak_act = peak - current  # warmup 期间的激活 + 临时 buffer 峰值
+
+        # block_bytes: 一个 block 的 K + V cache (所有层, bf16)
         attn0 = self.model.layers[0].self_attn
-        expected_shape = (self.NUM_BLOCKS, self.BLOCK_SIZE, attn0.num_kv_heads, attn0.head_dim)
+        block_bytes = (2 * len(self.model.layers) * self.BLOCK_SIZE *
+                       attn0.num_kv_heads * attn0.head_dim * 2)
+
+        available = int(total * gpu_memory_utilization - used - peak_act)
+        num_blocks = max(available // block_bytes, 1)
+
+        print(f"  KV Cache 动态分配: GPU={total/1e9:.1f}GB, "
+              f"peak_act={peak_act/1e6:.0f}MB, "
+              f"blocks={num_blocks} ({num_blocks * self.BLOCK_SIZE} tokens)")
+        return num_blocks
+
+    def allocate_global_kv_cache(self):
+        """分配全局 KV cache：[layers, num_blocks, block_size, kv_heads, dim]。
+
+        首次调用时通过 warmup 动态计算 NUM_BLOCKS。
+        如果已分配过相同形状则跳过，避免重复分配 OOM。"""
+        attn0 = self.model.layers[0].self_attn
+        num_layers = len(self.model.layers)
+        n_kv = attn0.num_kv_heads
+        d = attn0.head_dim
+
+        # 动态计算 NUM_BLOCKS (首次调用)
+        num_blocks = getattr(self, '_num_blocks', 0)
+        if num_blocks == 0:
+            num_blocks = self._compute_num_blocks()
+            self._num_blocks = num_blocks
+
+        # 已分配过相同形状则跳过
+        expected_shape = (num_blocks, self.BLOCK_SIZE, n_kv, d)
         if hasattr(attn0, 'k_cache') and attn0.k_cache is not None and \
            attn0.k_cache.shape == expected_shape:
-            return  # 已分配，跳过
+            return
 
-        config = self.model.layers[0].self_attn
-        num_layers = len(self.model.layers)
-        n_kv = config.num_kv_heads
-        d = config.head_dim
-
-        k = torch.empty(num_layers, self.NUM_BLOCKS, self.BLOCK_SIZE, n_kv, d,
+        k = torch.empty(num_layers, num_blocks, self.BLOCK_SIZE, n_kv, d,
                         dtype=torch.bfloat16, device='cuda')
-        v = torch.empty(num_layers, self.NUM_BLOCKS, self.BLOCK_SIZE, n_kv, d,
+        v = torch.empty(num_layers, num_blocks, self.BLOCK_SIZE, n_kv, d,
                         dtype=torch.bfloat16, device='cuda')
 
         for i, layer in enumerate(self.model.layers):
@@ -992,7 +1041,7 @@ class Qwen3ForCausalLM(nn.Module):
         """
         MAX_TOKENS_PER_STEP = 2048
 
-        bm = BlockManager(self.NUM_BLOCKS, self.BLOCK_SIZE)
+        bm = BlockManager(self._num_blocks, self.BLOCK_SIZE)
         self.allocate_global_kv_cache()
 
         # 用 prompt_ids_list 创建 Sequence
@@ -1300,7 +1349,7 @@ if __name__ == '__main__':
                 "推荐三本科幻小说",
             ]
 
-        print(f"\nContinuous Batching 模式: {len(prompt_texts)} 条 prompt, {model.NUM_BLOCKS} blocks")
+        print(f"\nContinuous Batching 模式: {len(prompt_texts)} 条 prompt, {model._num_blocks} blocks")
 
         prompt_ids_list = []
         for i, text in enumerate(prompt_texts):
