@@ -110,6 +110,7 @@ class Sequence:
         self.status = "WAITING"       # WAITING → RUNNING → FINISHED
         self.block_table = []         # 页表: [3, 7, 12] — 逻辑块→物理块
         self.cached_len = 0           # 已写入 KV cache 的 token 数量
+        self.num_cached_tokens = 0   # 前缀有多少 token 已在 cache 里 (prefix caching)
         sp = sampling_params or {}
         self.temperature = sp.get("temperature", 0.6)
         self.max_tokens = sp.get("max_tokens", 256)
@@ -126,6 +127,12 @@ class Sequence:
     def num_blocks(self):
         return (len(self.token_ids) + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
 
+    def block(self, i: int) -> list[int]:
+        """返回第 i 个逻辑块的 token ID 列表，用于 prefix caching hash"""
+        start = i * self.BLOCK_SIZE
+        end = min(start + self.BLOCK_SIZE, len(self.token_ids))
+        return self.token_ids[start:end]
+
     @property
     def num_completion_tokens(self):
         return len(self.token_ids) - self.num_prompt_tokens
@@ -140,34 +147,125 @@ class Sequence:
 
 
 class BlockManager:
-    """页式 KV cache 管理：按需分配 256-token 的块"""
+    """页式 KV cache 管理：按需分配 256-token 的块，支持 prefix caching。
+
+    核心数据结构:
+      free:           空闲物理块队列
+      ref_count:      每个 block 被多少个 seq 引用 (prefix caching 共享)
+      block_hash:     每个 block 的链式 hash (基于 token ID + 前一个 block hash)
+      block_tokens:   每个 block 的 token ID 副本 (防 hash 碰撞)
+      hash_to_block:  全局查找表 {chain_hash: block_id}
+    """
 
     def __init__(self, num_blocks: int, block_size: int):
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.free = list(range(num_blocks))
+        self.ref_count = [0] * num_blocks
+        self.block_hash = [-1] * num_blocks
+        self.block_tokens = [None] * num_blocks
+        self.hash_to_block: dict[int, int] = {}
 
+    @staticmethod
+    def compute_hash(token_ids: list[int], prefix_hash: int = -1) -> int:
+        """链式哈希: 每个 block 的 hash 混合了前一个 block 的 hash。
+        确保 block N 的共享只有在整个前缀全部一致时才发生。"""
+        h = prefix_hash if prefix_hash != -1 else 0
+        for t in token_ids:
+            h = ((h << 5) + h) ^ t      # djb2 变体
+        return h & 0xFFFFFFFFFFFFFFFF    # 64-bit
+
+    # ================================================================
+    # Prefix caching 核心: allocate 先查 hash 表共享, 不够再分配新块
+    # ================================================================
     def allocate(self, seq: Sequence):
-        """分配刚好够用的块数，填进 seq.block_table"""
-        n = seq.num_blocks
-        assert len(self.free) >= n, f"need {n} blocks, have {len(self.free)}"
-        for _ in range(n):
-            seq.block_table.append(self.free.pop())
+        """分配块给序列，优先共享已缓存的前缀 block。"""
+        assert not seq.block_table, "block_table 应该为空"
 
+        h = -1
+        num_cached = 0
+
+        # ① 遍历满 block (最后一个可能不满的跳过), 检查能否共享
+        for i in range(seq.num_blocks - 1):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            blk = self.hash_to_block.get(h, -1)
+
+            # 检查 hash 命中 + 确认为同一段 token (防碰撞)
+            if blk == -1 or self.block_tokens[blk] != token_ids:
+                break
+
+            num_cached += 1
+            # block 在 free 列表中 (之前的 seq 已释放但 hash 还在)
+            if blk in self.free:
+                self.free.remove(blk)
+            self.ref_count[blk] += 1
+            seq.block_table.append(blk)
+
+        # ② 剩余块从 free 分配
+        for i in range(num_cached, seq.num_blocks):
+            blk = self.free.pop()
+            # 如果这个 free block 之前有 hash (旧缓存), 清除
+            if self.block_hash[blk] != -1:
+                old_h = self.block_hash[blk]
+                if self.hash_to_block.get(old_h) == blk:
+                    del self.hash_to_block[old_h]
+                self.block_hash[blk] = -1
+                self.block_tokens[blk] = None
+            self.ref_count[blk] = 1
+            seq.block_table.append(blk)
+
+        seq.num_cached_tokens = num_cached * self.block_size
+
+    # ================================================================
+    # deallocate: ref_count--, 降到 0 归还 free (但保留 hash 供复用!)
+    # ================================================================
     def deallocate(self, block_table: list[int]):
-        """归还所有块"""
+        """归还块: 减引用计数, 归零后放回 free。hash 不删除, 后续可能被复用。"""
         for b in block_table:
-            self.free.append(b)
+            self.ref_count[b] -= 1
+            if self.ref_count[b] == 0:
+                self.free.append(b)        # hash 和 block_tokens 保留!
 
+    # ================================================================
+    # decode 时按需追加 block
+    # ================================================================
     def can_append(self, seq: Sequence) -> bool:
-        """长度刚跨过 256 边界时需要新块，有空闲吗"""
+        """是否需要新块 + 是否还有空闲"""
         need = seq.num_tokens % self.block_size == 0
         return (not need) or len(self.free) > 0
 
     def may_append(self, seq: Sequence):
-        """需要就追加"""
+        """需要就追加, 并管理 ref_count + 清除旧 hash"""
         if seq.num_tokens % self.block_size == 0:
-            seq.block_table.append(self.free.pop())
+            blk = self.free.pop()
+            if self.block_hash[blk] != -1:
+                old_h = self.block_hash[blk]
+                if self.hash_to_block.get(old_h) == blk:
+                    del self.hash_to_block[old_h]
+                self.block_hash[blk] = -1
+                self.block_tokens[blk] = None
+            self.ref_count[blk] = 1
+            seq.block_table.append(blk)
+
+    # ================================================================
+    # hash_blocks: prefill 完成后注册满 block 的 hash
+    # ================================================================
+    def hash_blocks(self, seq: Sequence):
+        """prefill 后把完整写入的 block 注册到 hash 表。"""
+        full_blocks = seq.num_prompt_tokens // self.block_size
+        start = seq.num_cached_tokens // self.block_size
+
+        # 找链式起点: 前一个 block 的 hash (可能来自共享或之前注册的)
+        h = self.block_hash[seq.block_table[start - 1]] if start > 0 else -1
+
+        for i in range(start, full_blocks):
+            blk = seq.block_table[i]
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            self.block_hash[blk] = h
+            self.block_tokens[blk] = token_ids
+            self.hash_to_block[h] = blk
 
     @property
     def available(self):
@@ -404,14 +502,17 @@ class Qwen3Attention(nn.Module):
     # ===== Continuous Batching: Prefill 和 Decode 路径 =====
 
     def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
-                        max_seqlen_q, max_seqlen_k, block_mapping):
+                        max_seqlen_q, max_seqlen_k, block_mapping,
+                        block_tables=None):
         """
         Prefill: 一次性处理多条序列的 prompt，K/V 写入全局 cache。
 
-        x:             [total_tokens, hidden]
-        positions:     [total_tokens]  各 token 在各自序列内的位置
-        cu_seqlens_*:  [num_seqs + 1]  累积序列长度
-        block_mapping: [total_tokens]  每个 token 对应 cache 位置 = blk * BLOCK_SIZE + off
+        x:             [total_tokens, hidden]    只包含需要计算的 token (不含缓存前缀)
+        positions:     [total_tokens]            各 token 在各自序列内的绝对位置
+        cu_seqlens_q:  [num_seqs + 1]            新 token 的累积长度
+        cu_seqlens_k:  [num_seqs + 1]            全部 token 的累积长度 (含缓存前缀)
+        block_mapping: [total_tokens]            新 token 写入 cache 的物理地址
+        block_tables:  [batch, max_blocks]|None  有前缀缓存时使用, flash_attn 凭此读缓存
         """
         tokens, _ = x.shape
 
@@ -435,11 +536,17 @@ class Qwen3Attention(nn.Module):
             k_flat[block_mapping] = k
             v_flat[block_mapping] = v
 
+        # 有前缀缓存: 传整个 cache (含刚写入的 K/V), flash_attn 通过 block_tables 寻址
+        if block_tables is not None:
+            k = self.k_cache
+            v = self.v_cache
+
         o = flash_attn_varlen_func(
             q, k, v,
             max_seqlen_q=max_seqlen_q, cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=max_seqlen_k, cu_seqlens_k=cu_seqlens_k,
             softmax_scale=self.scale, causal=True,
+            block_table=block_tables,
         )
 
         o = o.view(tokens, -1)
@@ -535,10 +642,12 @@ class Qwen3DecoderLayer(nn.Module):
         return x
 
     def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
-                        max_seqlen_q, max_seqlen_k, block_mapping):
+                        max_seqlen_q, max_seqlen_k, block_mapping,
+                        block_tables=None):
         x = self.self_attn.forward_prefill(
             self.input_layernorm(x), positions,
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, block_mapping,
+            block_tables,
         ) + x
         x = self.mlp(self.post_attention_layernorm(x)) + x
         return x
@@ -578,11 +687,13 @@ class Qwen3Model(nn.Module):
         return h
 
     def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
-                        max_seqlen_q, max_seqlen_k, block_mapping):
+                        max_seqlen_q, max_seqlen_k, block_mapping,
+                        block_tables=None):
         h = self.embed_tokens(x)
         for layer in self.layers:
             h = layer.forward_prefill(h, positions, cu_seqlens_q, cu_seqlens_k,
-                                       max_seqlen_q, max_seqlen_k, block_mapping)
+                                       max_seqlen_q, max_seqlen_k, block_mapping,
+                                       block_tables)
         h = self.norm(h)
         return h
 
@@ -771,7 +882,15 @@ class Qwen3ForCausalLM(nn.Module):
     BLOCK_SIZE = 256
 
     def allocate_global_kv_cache(self):
-        """分配全局 KV cache：[layers, num_blocks, block_size, kv_heads, dim]"""
+        """分配全局 KV cache：[layers, num_blocks, block_size, kv_heads, dim]
+        如果已分配过相同形状则跳过，避免重复分配 OOM。"""
+        # 检查是否已经分配过正确形状的 cache
+        attn0 = self.model.layers[0].self_attn
+        expected_shape = (self.NUM_BLOCKS, self.BLOCK_SIZE, attn0.num_kv_heads, attn0.head_dim)
+        if hasattr(attn0, 'k_cache') and attn0.k_cache is not None and \
+           attn0.k_cache.shape == expected_shape:
+            return  # 已分配，跳过
+
         config = self.model.layers[0].self_attn
         num_layers = len(self.model.layers)
         n_kv = config.num_kv_heads
@@ -787,21 +906,34 @@ class Qwen3ForCausalLM(nn.Module):
             layer.self_attn.v_cache = v[i]
 
     def _prepare_prefill(self, seqs: list[Sequence]):
-        """构建 varlen prefill 输入和 block_mapping"""
+        """构建 varlen prefill 输入和 block_mapping。
+        支持 prefix caching: 只 prefill 新 token, 缓存前缀通过 block_tables 读。
+
+        返回: (input_ids, positions, cu_seqlens_q, cu_seqlens_k,
+               max_seqlen_q, max_seqlen_k, block_mapping, block_tables)
+        """
         input_ids, positions = [], []
-        cu_seqlens_q = [0]
-        max_seqlen = 0
+        cu_seqlens_q = [0]      # 新 token 累积长度
+        cu_seqlens_k = [0]      # 全部 token 累积长度 (含缓存前缀)
+        max_seqlen_q = 0
+        max_seqlen_k = 0
         block_mapping = []
+        has_prefix = any(s.num_cached_tokens > 0 for s in seqs)
 
         for seq in seqs:
-            L = seq.num_prompt_tokens  # prefill 时整个 prompt 一次性处理
-            input_ids.extend(seq.token_ids[:L])
-            positions.extend(range(L))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + L)
-            max_seqlen = max(max_seqlen, L)
+            start = seq.num_cached_tokens       # 跳过已缓存的 token
+            L = seq.num_prompt_tokens           # 总 prompt 长度
+            new_tokens = L - start               # 需要 prefill 的新 token 数
 
-            # 每个 token → 物理块号 (页表查表) × BLOCK_SIZE + 块内偏移
-            for pos in range(L):
+            input_ids.extend(seq.token_ids[start:L])
+            positions.extend(range(start, L))   # 位置从 start 继续
+            cu_seqlens_q.append(cu_seqlens_q[-1] + new_tokens)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + L)
+            max_seqlen_q = max(max_seqlen_q, new_tokens)
+            max_seqlen_k = max(max_seqlen_k, L)
+
+            # 只为新 token 构建 block_mapping (写入 cache)
+            for pos in range(start, L):
                 blk = seq.block_table[pos // self.BLOCK_SIZE]
                 off = pos % self.BLOCK_SIZE
                 block_mapping.append(blk * self.BLOCK_SIZE + off)
@@ -810,9 +942,23 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
         positions = torch.tensor(positions, dtype=torch.long, device=device)
         cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
+        cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
         blk_map = torch.tensor(block_mapping, dtype=torch.int32, device=device)
 
-        return input_ids, positions, cu_q, cu_q, max_seqlen, max_seqlen, blk_map
+        if has_prefix:
+            block_tables = self._build_block_tables(seqs)
+        else:
+            block_tables = None
+
+        return input_ids, positions, cu_q, cu_k, max_seqlen_q, max_seqlen_k, blk_map, block_tables
+
+    def _build_block_tables(self, seqs: list[Sequence]):
+        """构建 block_tables tensor: [batch, max_blocks], 短序列填 -1"""
+        max_blocks = max(len(s.block_table) for s in seqs)
+        bt = torch.full((len(seqs), max_blocks), -1, dtype=torch.int32, device='cuda')
+        for i, s in enumerate(seqs):
+            bt[i, :len(s.block_table)] = torch.tensor(s.block_table, dtype=torch.int32, device='cuda')
+        return bt
 
     def _prepare_decode(self, seqs: list[Sequence]):
         """构建 decode 输入：block_tables 用于 flash_attn 寻址"""
@@ -865,13 +1011,14 @@ class Qwen3ForCausalLM(nn.Module):
 
             if pref_seqs:
                 # ---- Prefill ----
-                input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map = self._prepare_prefill(pref_seqs)
-                h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map)
+                input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, bt = self._prepare_prefill(pref_seqs)
+                h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, bt)
                 logits = self.lm_head(h)
 
                 # 关键：prefill 完成后，整个 prompt 已经写进 KV cache
                 for seq in pref_seqs:
                     seq.cached_len = seq.num_prompt_tokens
+                    bm.hash_blocks(seq)          # 注册 block hash，供后续序列复用
 
                 # 取每条序列最后一个 token 的 logit
                 last_logits = torch.stack([

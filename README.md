@@ -1,6 +1,6 @@
 # qwen3-naive-inference
 
-纯 PyTorch + Flash Attention，零推理框架依赖，跑通 Qwen3-0.6B 真实对话模型。已实现 varlen 多 prompt 批处理、Continuous Batching、Paged Attention，以及 GRPO 训练循环。
+纯 PyTorch + Flash Attention，零推理框架依赖，跑通 Qwen3-0.6B 真实对话模型。已实现 varlen 多 prompt 批处理、Continuous Batching、Paged Attention、Prefix Caching，以及 GRPO 训练循环。
 
 **不需要 HuggingFace 的模型代码，不需要推理框架。有 config.json + model.safetensors + PyTorch 就能跑。**
 
@@ -23,10 +23,13 @@ python qwen3_naive.py --kvcache "你好"
 python qwen3_naive.py --varlen
 python qwen3_naive.py --varlen --prompts-file=prompts.txt
 
-# 6. Continuous Batching + Paged Attention
+# 6. Continuous Batching + Paged Attention + Prefix Caching
 python qwen3_naive.py --continuous
 
-# 7. GRPO 训练
+# 7. Prefix Caching 验证
+python test_prefix_cache.py
+
+# 8. GRPO 训练
 python qwen3_grpo_train.py
 
 # Benchmark
@@ -47,7 +50,7 @@ python qwen3_naive.py --bench --num-seqs=64 --no-topk
 | `Qwen3ForCausalLM` | Model + lm_head，tie_word_embeddings 权重共享 |
 | `VarlenContext` | 全局上下文：cu_seqlens / positions / max_seqlen，避免改所有函数签名 |
 | `Sequence` | 序列状态机：WAITING → RUNNING → FINISHED，持有 block_table 页表 |
-| `BlockManager` | 物理块分配/释放，按需扩展（`can_append` / `may_append`） |
+| `BlockManager` | 物理块分配/释放/Prefix Caching：引用计数 + 链式 hash + 全局查找表 |
 | `load_weights` | `struct.unpack` 解析 safetensors → 逐张量拷进模型 |
 
 ### 4 种生成模式
@@ -206,6 +209,91 @@ v_cache = torch.empty(num_layers, NUM_BLOCKS, BLOCK_SIZE, n_kv_heads, head_dim)
 
 运行时所有操作都是**对已有 tensor 的 view 写入**——`k_cache[blk * 256 + off] = k_new`，不产生新的 GPU 分配。这确保了推理延迟稳定，不会因 CUDA malloc 产生抖动。
 
+## Prefix Caching：架构洞察
+
+### 1. 核心思想：用 token ID 的 hash 来识别可共享的 KV cache
+
+相同的 token 序列 → 相同的 K/V → 不需要重新计算。Prefix Caching 通过比对 **token ID**（不是 K/V 值）来判断前缀是否可共享：
+
+```
+序列 A: [sys prompt 400 tokens | 用户问题A]  → 前 400 token 的 K/V 已在 cache
+序列 B: [sys prompt 400 tokens | 用户问题B]  → 前 256 token 命中 hash → 只算后 144 个
+```
+
+### 2. 链式 Hash：确保整个前缀链一致才共享
+
+```python
+Block 0 hash = hash(token_ids[0:256])
+Block 1 hash = hash(token_ids[256:512], prefix=hash_of_block_0)  # 混入前一个 hash
+Block 2 hash = hash(token_ids[512:768], prefix=hash_of_block_1)
+```
+
+如果只用 token ID 做 hash，两个不同前缀的序列可能在中间某个 block 发生碰撞。链式 hash 确保 block N 的共享**只有在前 N 个 block 全部相同时才发生**。
+
+### 3. 释放 ≠ 删除：LRU 式缓存复用
+
+```python
+def deallocate(self, block_table):
+    for b in block_table:
+        self.ref_count[b] -= 1
+        if self.ref_count[b] == 0:
+            self.free.append(b)       # block 回空闲池
+            # ★ hash 不删除! 后续序列可以捡回来用
+```
+
+即使原序列已经 decode 完，block 的 hash 标签还在。一旦有新序列需要相同前缀，block 从 free 池中被捡回来直接复用——K/V 数据还是热的，不需要重算。
+
+只有当 block 被真正分配给**不同用途**时才清除旧 hash：
+
+```python
+def _pop_free_block(self):
+    blk = self.free.pop()
+    if self.block_hash[blk] != -1:    # 这个 block 之前有标签
+        del self.hash_to_block[self.block_hash[blk]]  # 撕掉旧标签
+    self.block_hash[blk] = -1          # 清空
+    self.block_tokens[blk] = None
+    self.ref_count[blk] = 1
+    return blk
+```
+
+### 4. Prefill 时如何工作
+
+有前缀缓存时，prefill 传给 `flash_attn_varlen_func` 的是**整个 k_cache/v_cache + block_table**，而非刚算出来的 K/V：
+
+```python
+# 只算新 token (后缀) 的 K/V
+k_new, v_new = compute_kv(tokens[cached_len:])
+
+# 写入 cache
+k_cache[block_mapping] = k_new
+
+# 有前缀缓存: 传整个 cache，flash_attn 通过 block_table 自己找
+if block_tables is not None:
+    k, v = k_cache, v_cache
+
+flash_attn_varlen_func(q, k, v, 
+    cu_seqlens_q=[0, new_len],        # 只统计新 token
+    cu_seqlens_k=[0, cached+new],     # 统计全部 (含缓存前缀)
+    block_table=block_tables)         # 页表告诉 flash_attn 去哪读缓存
+```
+
+`cu_seqlens_k > cu_seqlens_q` 时，flash_attn 知道前面那段 K/V 不在传入的 tensor 里，需要从 cache 通过 block_table 读取。
+
+### 5. 同批次不共享，跨批次才生效
+
+同一批 prefill 的序列之间不会共享——因为 hash 是 prefill 完成后才注册的。Prefix Caching 的价值体现在**后续批次**中。
+
+### 6. 验证结果
+
+```
+第 1 条 prompt: 292 tokens  → prefill 全部 292
+第 5 条 prompt: 293 tokens  → prefix 命中 256 tokens → 只 prefill 37 个新 token
+
+top-1 一致: ✅
+top-20 overlap: 19/20
+block ref_count: 2 (两个 sequence 共享同一个物理 block)
+```
+
 ## GPU 显存分配：我们 vs nano-vllm
 
 ### nano-vllm 的动态计算
@@ -299,7 +387,7 @@ TEMPERATURE = 0.8     # RL 用高温度鼓励探索
 | P3 | 动态 KV Cache 分配（warmup 测 peak） | 适配不同显卡 | ❌ 当前硬编码 `NUM_BLOCKS=64` |
 | P4 | Chunked Prefill | 避免长 prompt 显存峰值 | ❌ |
 | P5 | Preemption（显存不足时驱逐序列） | 提高并发上限 | ❌ |
-| P6 | Prefix Caching（hash 检测公共前缀） | 省显存 + 加速 | ❌ |
+| P6 | Prefix Caching（hash 检测公共前缀） | 省显存 + 省 prefill 计算 | ✅ `BlockManager` 链式 hash + 引用计数 |
 | P7 | torch.compile | ~1.3× | ❌ |
 | P8 | CUDA Graph | 减少 kernel launch 开销 | ❌ |
 
