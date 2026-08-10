@@ -162,8 +162,8 @@ def test_case3_kvlen_tracking(model, tokenizer, config):
     print(f"{'='*60}")
 
     clear_caches(model)
-    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
 
     # 使用较短 prompt (~1500 tokens) + 小 chunk(512), 适配 4 GiB 卡
     long_text = ("请详细解释机器学习中的各种概念，包括监督学习、无监督学习和强化学习，"
@@ -232,8 +232,8 @@ def test_case4_mixed_batch(model, tokenizer, config):
     print(f"{'='*60}")
 
     clear_caches(model)
-    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
     model.allocate_global_kv_cache()
+    bm = BlockManager(model._num_blocks, model.BLOCK_SIZE)
 
     # 2 条短 prompt, 1 条长 prompt
     short1_text = "你好。"

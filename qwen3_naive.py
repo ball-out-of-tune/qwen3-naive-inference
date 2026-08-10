@@ -1126,8 +1126,8 @@ class Qwen3ForCausalLM(nn.Module):
         """
         MAX_TOKENS_PER_STEP = 2048
 
+        self.allocate_global_kv_cache()           # 触发 warmup, 设置 _num_blocks
         bm = BlockManager(self._num_blocks, self.BLOCK_SIZE)
-        self.allocate_global_kv_cache()
 
         # 初始化 CUDA Graph (decode 加速)
         self._init_cuda_graphs()
