@@ -898,13 +898,8 @@ class Qwen3ForCausalLM(nn.Module):
         # 轻量 warmup: 256 tokens, 不撑爆小显存
         warmup_tokens = 256
         dummy = torch.randint(0, self.config.vocab_size, (1, warmup_tokens), device='cuda')
-        cu_sl = torch.tensor([0, warmup_tokens], dtype=torch.int32, device='cuda')
-        pos = torch.arange(0, warmup_tokens, dtype=torch.long, device='cuda')
-
-        set_varlen_context(cu_sl, cu_sl, warmup_tokens, warmup_tokens, pos)
         with torch.no_grad():
-            _ = self.forward(dummy)
-        clear_varlen_context()
+            _ = self.forward(dummy)   # 走默认 [batch, seq] 路径
         torch.cuda.synchronize()
         torch.cuda.empty_cache()  # 释放 warmup 的激活显存
 

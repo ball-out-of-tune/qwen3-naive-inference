@@ -31,7 +31,6 @@ def load_model_and_tokenizer():
     print(f"参数: {params:,}  |  VRAM: {vram:.2f} GB")
 
     # 4 GiB GPU 显存紧张，block 数减到 24 (KV cache ~700 MB)
-    model._num_blocks = 24
     return model, tokenizer, config
 
 
