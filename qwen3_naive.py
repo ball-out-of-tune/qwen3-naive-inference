@@ -1169,16 +1169,24 @@ class Qwen3ForCausalLM(nn.Module):
                         continue
 
                     if not bm.can_append(seq):
-                        # 没有空闲块 → 驱逐回 waiting
-                        seq.status = "WAITING"
-                        bm.deallocate(seq.block_table)
-                        seq.block_table.clear()
-                        seq.kv_len = 0   # 块全释放，cache 清零
-                        running.pop(i)
-                        waiting.insert(0, seq)
-                        continue
+                        # LIFO preemption: 先踢 running 末尾 (最新加入的),
+                        # 保护已生成很多步的老同志, 实在只剩自己才踢自己
+                        while not bm.can_append(seq):
+                            victim = running[-1]      # 找最新的
+                            victim.status = "WAITING"
+                            bm.deallocate(victim.block_table)
+                            victim.block_table.clear()
+                            victim.kv_len = 0
+                            running.pop()             # 弹出末尾 (LIFO)
+                            waiting.insert(0, victim)
 
-                    bm.may_append(seq)
+                            if victim is seq:         # 踢到自己 — 没法了
+                                break
+
+                        if seq.status == "WAITING":   # seq 被踢了
+                            continue
+                        # 别人被踢, seq 现在有块了
+                        bm.may_append(seq)
                     seq.num_scheduled_tokens = 1
                 else:
                     # ── MID-PREFILL 序列 ──
