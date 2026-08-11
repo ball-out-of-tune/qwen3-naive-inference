@@ -4,6 +4,32 @@ import json
 import torch
 import torch.nn as nn
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _store_kvcache_kernel(key_ptr, key_stride, value_ptr, value_stride,
+                           k_cache_ptr, v_cache_ptr, slot_mapping_ptr,
+                           D: tl.constexpr):
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1: return
+    key_offsets = idx * key_stride + tl.arange(0, D)
+    value_offsets = idx * value_stride + tl.arange(0, D)
+    key = tl.load(key_ptr + key_offsets)
+    value = tl.load(value_ptr + value_offsets)
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
+
+
+def store_kvcache(key, value, k_cache, v_cache, slot_mapping):
+    """将 K/V 写入全局 cache: 一次 kernel, 零中间 tensor, 零 dtype cast."""
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    _store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0),
+                                 k_cache, v_cache, slot_mapping, D)
 
 
 @dataclass
@@ -79,11 +105,16 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x):
+    def forward(self, x, residual=None):
         orig_dtype = x.dtype
         x_f32 = x.float()
+        if residual is not None:
+            # Fused: add residual + norm 一个 kernel 完成, 省一次显存读写
+            x_f32 = x_f32 + residual.float()
+            residual = x_f32.to(orig_dtype)
         x_f32 = x_f32 * torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (x_f32 * self.weight.float()).to(orig_dtype)
+        out = (x_f32 * self.weight.float()).to(orig_dtype)
+        return (out, residual) if residual is not None else out
 
 
 class BadRMSNorm:
@@ -344,10 +375,8 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim    # 1024
         self.scale = self.head_dim ** -0.5
 
-        # 分开的 Q、K、V 投影——和 checkpoint 名字对齐，不需要拼接
-        self.q_proj = nn.Linear(self.hidden_size, self.q_size, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=config.attention_bias)
+        # Fused QKV: 一次矩阵乘代替三次, 省 2 次 kernel launch + 2 次显存读写
+        self.qkv_proj = nn.Linear(self.hidden_size, self.q_size + 2 * self.kv_size, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=False)
 
         # QK-Norm：对 Q 和 K 做逐头归一化（Qwen3 没有 bias 所以有这个）
@@ -378,10 +407,9 @@ class Qwen3Attention(nn.Module):
         """
         batch, seq_len, _ = x.shape
 
-        # 1. QKV 投影
-        q = self.q_proj(x)    # [batch, seq, q_size]
-        k = self.k_proj(x)    # [batch, seq, kv_size]
-        v = self.v_proj(x)    # [batch, seq, kv_size]
+        # 1. QKV 投影 (fused: 一次 matmul → split)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # 2. view
         q = q.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -448,9 +476,8 @@ class Qwen3Attention(nn.Module):
             # ===== Varlen 路径: [total_tokens, hidden] =====
             tokens, _ = x.shape
 
-            q = self.q_proj(x)    # [tokens, q_size]
-            k = self.k_proj(x)    # [tokens, kv_size]
-            v = self.v_proj(x)    # [tokens, kv_size]
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             q = q.view(tokens, self.num_heads, self.head_dim)
             k = k.view(tokens, self.num_kv_heads, self.head_dim)
@@ -478,10 +505,9 @@ class Qwen3Attention(nn.Module):
         # ===== 原路径: [batch, seq, hidden] =====
         batch, seq_len, _ = x.shape
 
-        # 1. 分开投影 Q、K、V
-        q = self.q_proj(x)    # [batch, seq, 2048]
-        k = self.k_proj(x)    # [batch, seq, 1024]
-        v = self.v_proj(x)    # [batch, seq, 1024]
+        # 1. Fused QKV 投影
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # 2. view → [batch, seq_len, num_heads, head_dim]
         q = q.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -535,9 +561,8 @@ class Qwen3Attention(nn.Module):
         """
         tokens, _ = x.shape
 
-        q = self.q_proj(x)        # [tokens, q_size]
-        k = self.k_proj(x)        # [tokens, kv_size]
-        v = self.v_proj(x)        # [tokens, kv_size]
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = q.view(tokens, self.num_heads, self.head_dim)
         k = k.view(tokens, self.num_kv_heads, self.head_dim)
@@ -548,16 +573,11 @@ class Qwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(q, k, positions)
 
-        # 把 K/V 存入全局 cache（block_mapping 是展平后的物理地址）
+        # 把 K/V 存入全局 cache (Triton kernel, 零中间 tensor)
         if self.k_cache.numel():
-            k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
-            v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
-            k_flat[block_mapping] = k.to(k_flat.dtype)
-            v_flat[block_mapping] = v.to(v_flat.dtype)
-            # q/k/v 统一 cast 到 cache dtype (WSL2 上 q_proj/k_proj 可能输出 float32)
-            q = q.to(k_flat.dtype)
-            k = k.to(k_flat.dtype)
-            v = v.to(k_flat.dtype)
+            store_kvcache(k, v, self.k_cache, self.v_cache, block_mapping)
+            # q 统一 cast 到 cache dtype (WSL2 上 qkv_proj 可能输出 float32)
+            q = q.to(self.k_cache.dtype)
 
         # 始终从 cache 读 (含刚写入的 K/V), flash_attn 通过 block_tables 寻址
         o = flash_attn_varlen_func(
@@ -583,9 +603,8 @@ class Qwen3Attention(nn.Module):
         """
         batch = x.shape[0]
 
-        q = self.q_proj(x)          # [batch, q_size]
-        k_new = self.k_proj(x)      # [batch, kv_size]
-        v_new = self.v_proj(x)      # [batch, kv_size]
+        qkv = self.qkv_proj(x)
+        q, k_new, v_new = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = q.view(batch, self.num_heads, self.head_dim)
         k_new = k_new.view(batch, self.num_kv_heads, self.head_dim)
@@ -596,22 +615,10 @@ class Qwen3Attention(nn.Module):
 
         q, k_new = self.rotary_emb(q, k_new, positions)
 
-        # 把新 K/V 写入全局 cache: 纯 tensor 索引, 可用于 CUDA Graph
+        # 把新 K/V 写入全局 cache (Triton kernel, 零中间 tensor)
         if self.k_cache.numel():
-            k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
-            v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
-            if slot_mapping is not None:
-                k_flat[slot_mapping] = k_new.to(k_flat.dtype)
-                v_flat[slot_mapping] = v_new.to(v_flat.dtype)
-            else:
-                for i in range(batch):
-                    pos = context_lens[i].item()
-                    blk = block_tables[i, pos // 256].item()
-                    off = pos % 256
-                    idx = blk * 256 + off
-                    k_flat[idx] = k_new[i].to(k_flat.dtype)
-                    v_flat[idx] = v_new[i].to(v_flat.dtype)
-            q = q.to(k_flat.dtype)
+            store_kvcache(k_new, v_new, self.k_cache, self.v_cache, slot_mapping)
+            q = q.to(self.k_cache.dtype)
 
         # flash_attn 从 cache 读历史 K/V（靠 block_table 寻址）
         o = flash_attn_with_kvcache(
@@ -668,21 +675,32 @@ class Qwen3DecoderLayer(nn.Module):
 
     def forward_prefill(self, x, positions, cu_seqlens_q, cu_seqlens_k,
                         max_seqlen_q, max_seqlen_k, block_mapping,
-                        block_tables=None):
-        x = self.self_attn.forward_prefill(
-            self.input_layernorm(x), positions,
+                        block_tables=None, residual=None):
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(x), x
+        else:
+            hidden_states, residual = self.input_layernorm(x, residual)
+        hidden_states = self.self_attn.forward_prefill(
+            hidden_states, positions,
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, block_mapping,
             block_tables,
-        ) + x
-        x = self.mlp(self.post_attention_layernorm(x)) + x
-        return x
+        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
-    def forward_decode(self, x, positions, context_lens, block_tables, slot_mapping=None):
-        x = self.self_attn.forward_decode(
-            self.input_layernorm(x), positions, context_lens, block_tables, slot_mapping,
-        ) + x
-        x = self.mlp(self.post_attention_layernorm(x)) + x
-        return x
+    def forward_decode(self, x, positions, context_lens, block_tables,
+                       slot_mapping=None, residual=None):
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(x), x
+        else:
+            hidden_states, residual = self.input_layernorm(x, residual)
+        hidden_states = self.self_attn.forward_decode(
+            hidden_states, positions, context_lens, block_tables, slot_mapping,
+        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 class Qwen3Model(nn.Module):
@@ -715,23 +733,36 @@ class Qwen3Model(nn.Module):
                         max_seqlen_q, max_seqlen_k, block_mapping,
                         block_tables=None):
         h = self.embed_tokens(x)
+        residual = None
         for layer in self.layers:
-            h = layer.forward_prefill(h, positions, cu_seqlens_q, cu_seqlens_k,
-                                       max_seqlen_q, max_seqlen_k, block_mapping,
-                                       block_tables)
-        h = self.norm(h)
+            h, residual = layer.forward_prefill(
+                h, positions, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, block_mapping,
+                block_tables, residual,
+            )
+        h, _ = self.norm(h, residual)
         return h
 
     def forward_decode(self, x, positions, context_lens, block_tables, slot_mapping=None):
         h = self.embed_tokens(x)
+        residual = None
         for layer in self.layers:
-            h = layer.forward_decode(h, positions, context_lens, block_tables, slot_mapping)
-        h = self.norm(h)
+            h, residual = layer.forward_decode(
+                h, positions, context_lens, block_tables, slot_mapping, residual,
+            )
+        h, _ = self.norm(h, residual)
         return h
 
 
 class Qwen3ForCausalLM(nn.Module):
     """Qwen3 模型总入口：Model + lm_head"""
+
+    # 告诉 load_weights 如何把 checkpoint 的独立参数拼到 fused 参数里
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+    }
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
@@ -1346,6 +1377,8 @@ def load_weights(model, checkpoint_path):
         header = json.loads(f.read(header_size).decode("utf-8"))
         device = next(model.parameters()).device
 
+        packed_mapping = getattr(model, 'packed_modules_mapping', {})
+
         for name, info in header.items():
             if name == "__metadata__":
                 continue
@@ -1353,7 +1386,23 @@ def load_weights(model, checkpoint_path):
                 continue   # tie_word_embeddings
 
             tensor = _read_tensor(f, info, header_size, device).to(device)
-            model.get_parameter(name).data.copy_(tensor)
+
+            # 检查是否需要拼到 fused 参数 (packed_modules_mapping)
+            for packed_key, (fused_suffix, shard_id) in packed_mapping.items():
+                if packed_key in name:
+                    param_name = name.replace(packed_key, fused_suffix)
+                    param = model.get_parameter(param_name)
+                    # 计算切片: q→前部, k→中部, v→后部 (k/v 同形状)
+                    if shard_id == "q":
+                        offset = 0
+                    elif shard_id == "k":
+                        offset = param.shape[0] - 2 * tensor.shape[0]  # q_size
+                    else:  # "v"
+                        offset = param.shape[0] - tensor.shape[0]       # q_size + kv_size
+                    param.data[offset:offset + tensor.shape[0]] = tensor
+                    break
+            else:
+                model.get_parameter(name).data.copy_(tensor)
 
     print("权重加载完成!")
 
