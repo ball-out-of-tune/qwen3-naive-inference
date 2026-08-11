@@ -294,75 +294,92 @@ top-20 overlap: 19/20
 block ref_count: 2 (两个 sequence 共享同一个物理 block)
 ```
 
-## GPU 显存分配：我们 vs nano-vllm
+## GPU 显存分配 & 优化：我们 vs nano-vllm
 
-### nano-vllm 的动态计算
-
-```python
-# model_runner.py — warmup 测激活值峰值，再分配 KV cache
-free, total = torch.cuda.mem_get_info()
-used = total - free
-peak   = torch.cuda.memory_stats()["allocated_bytes.all.peak"]    # warmup 记录
-current = torch.cuda.memory_stats()["allocated_bytes.all.current"] # 当前常住
-
-num_blocks = int(total × 0.9 - used - peak + current) // block_bytes
-```
-
-每一步的语义：
-
-| 项 | 含义 | 如何得到 |
-|----|------|---------|
-| `total × 0.9` | 总预算（留 10% 安全边界） | 配置 |
-| `used` | 驱动层面物理占用（模型 + CUDA 上下文） | `mem_get_info` |
-| `peak` | warmup 时峰值分配（模型 + 最大激活值） | `memory_stats` |
-| `current` | 当前常住分配（模型权重，激活值已被 `empty_cache` 释放） | `memory_stats` |
-| `peak - current` | **激活值峰值** | warmup 实测 |
-| `used - current` | CUDA 驱动开销 + PyTorch allocator 预留 | 实测 |
-
-公式展开就是：
-
-```
-KV cache = 0.9 × total - 模型权重 - 激活值峰值 - CUDA 开销
-```
-
-**关键设计：`peak - current` 通过 warmup 实测，而非公式估算。** warmup 用 `max_num_batched_tokens` 的最大值跑一次 forward，记录最坏情况的激活值峰值，保证 KV cache 分配后真实推理不会 OOM。
-
-warmup 的规模由配置决定：
+### KV Cache 分配公式（两者相同）
 
 ```python
-seq_len  = min(max_num_batched_tokens, max_model_len)  # 默认: min(16384, 4096) = 4096
-num_seqs = min(max_num_batched_tokens // seq_len, max_num_seqs)  # 默认: 4
-# 跑 4 × 4096 = 16384 token 同时 forward
-```
-
-### 我们的实现：动态分配 + WSL2 兼容
-
-```python
-# qwen3_naive.py — _compute_num_blocks
-torch.cuda.empty_cache()
-torch.cuda.reset_peak_memory_stats()
-
-# Warmup: 256-token 前向传播 → 线性外推到 2048 (max chunk size)
-dummy = torch.randint(0, vocab_size, (1, 256))
-_ = self.forward(dummy)
-torch.cuda.empty_cache()
-
+# 双方都用同一套公式
 free, total = torch.cuda.mem_get_info()
 used   = total - free
 peak   = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-peak_act = (peak - current) * 8     # 256 → 2048 缩放
+peak_act = peak - current
 
-available = total * 0.9 - used - peak_act
-num_blocks = max(available // block_bytes, 1)
+num_blocks = int(total × gpu_memory_utilization - used - peak_act) // block_bytes
+#            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^   ^^^^   ^^^^^^^^^
+#            总预算 (90%)                        模型   激活值峰值
 ```
 
-**和 nano-vllm 的差异**：
-- nano-vllm warmup 用完整的 2048-token batch（更准但显存消耗大）
-- 我们用 256 tokens + ×8 缩放（更轻量，4GB 卡上不 OOM）
-- WSL2 下 `memory_stats()` 可能返回 < 10MB 的异常值，自动切换到保守模式（预留 30% 空闲显存）
+两者都用 2048-token warmup 实测 `peak_act`，不做外推。
 
-**实测 (RTX 4090 50GB)**：peak_act=78MB → 缩放后 624MB，分配 ~982 blocks。
+### 显存优化洞察：RTX 3050 Ti 4GB WSL2
+
+在 4GB 卡上，KV cache block 数从最初的 **16 → 37 → 35（稳定）**。关键发现：
+
+**1. RoPE `cos_sin_cache` 不能每层独立创建（省 ~567MB）**
+
+```python
+# ❌ 我们的旧代码：28 层各创建一份 RotaryEmbedding
+class Qwen3Attention:
+    def __init__(self, config):
+        self.rotary_emb = RotaryEmbedding(head_dim=128, max_position=40960, ...)
+        # → 每层 register_buffer("cos_sin_cache", [40960, 128] float32)
+        # → 28 层 × 21MB = 588MB 重复数据！
+
+# ✅ nano-vllm 的做法：@lru_cache 共享同一实例
+@lru_cache(8)
+def get_rope(head_dim, max_position, rope_theta):
+    return RotaryEmbedding(head_dim, max_position, rope_theta)
+    # → 28 层调用，参数相同，返回同一个对象 → 只有 1 份 21MB cache
+
+class Qwen3Attention:
+    def __init__(self, config):
+        self.rotary_emb = get_rope(128, 40960, 1000000)
+```
+
+**2. `tie_word_embeddings` 要用 `.data =` 而非 Parameter 赋值（省 ~311MB）**
+
+```python
+# ❌ 旧代码：lm_head 的旧 weight tensor 变成孤儿，占 311MB
+self.lm_head.weight = self.model.embed_tokens.weight
+
+# ✅ nano-vllm 的做法：只替换底层数据，不产生孤儿 tensor
+self.lm_head.weight.data = self.model.embed_tokens.weight.data
+```
+
+**3. WSL2 CUDA 驱动有 ~842MB 固定开销**
+
+`import torch` 后什么都不做，`mem_get_info` 就显示 used=842MB。这是 WSL2 的 CUDA 驱动翻译层开销，Linux 原生环境下没有。**nano-vllm 同样有这 842MB**。
+
+**4. `torch.set_default_device('cuda')` 应建模后恢复**
+
+nano-vllm 在 ModelRunner  init 结束后恢复 `set_default_device('cpu')`：
+```python
+torch.set_default_device("cuda")
+self.model = _create_model(hf_config)
+# ... 初始化完成 ...
+torch.set_default_device("cpu")  # ← 恢复！避免后续临时 tensor 默认占 GPU
+```
+
+我们的热路径所有 tensor 都显式写了 `device='cuda'`，不受影响；但保持 `default_device('cuda')` 会让 PyTorch allocator 预留更多显存。
+
+### 实测对比（4GB WSL2）
+
+| 指标 | 优化前 | 优化后 | nano-vllm |
+|------|--------|--------|-----------|
+| `used`（驱动层面） | 2686MB | 2119MB | ~2306MB* |
+| KV blocks | 16 | **35** | 47 |
+| KV cache 显存 | 470MB | 1030MB | 1382MB |
+| Throughput (4 seqs) | 278 tok/s | 276 tok/s | ~280 tok/s |
+
+*nano-vllm 的 `used` 为推断值（total - allocated - kv_cache）*
+
+**剩余差距（35 vs 47 blocks）来源**：
+- nano-vllm 使用 fused QKV projection（1 次矩阵乘 vs 3 次），减少中间激活
+- nano-vllm 使用 fused residual add（norm 和 add 一步完成），减少中间 tensor
+- nano-vllm 使用 Triton `store_kvcache_kernel` 写入 cache，避免 Python 索引 + dtype cast
+- 这些优化主要影响 `peak_act`（激活值峰值）和 PyTorch allocator 碎片
 
 ## GRPO 训练
 

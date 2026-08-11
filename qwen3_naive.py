@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import torch
 import torch.nn as nn
@@ -324,6 +325,12 @@ class RotaryEmbedding(nn.Module):
         k = rotate(k, orig_dtype_k)
         return q, k
 
+@lru_cache(8)
+def get_rope(head_dim: int, max_position: int, rope_theta: float):
+    """共享 RotaryEmbedding：相同参数只创建一次，避免每层重复分配 cos_sin_cache (~21MB)"""
+    return RotaryEmbedding(head_dim, max_position, rope_theta)
+
+
 class Qwen3Attention(nn.Module):
     """GQA + QK-Norm + RoPE —— Qwen3 的 attention 层"""
 
@@ -352,7 +359,7 @@ class Qwen3Attention(nn.Module):
         self.v_cache = None
 
         # RoPE：旋转位置编码
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             self.head_dim,
             config.max_position_embeddings,
             config.rope_theta,
@@ -545,8 +552,12 @@ class Qwen3Attention(nn.Module):
         if self.k_cache.numel():
             k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
             v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
-            k_flat[block_mapping] = k
-            v_flat[block_mapping] = v
+            k_flat[block_mapping] = k.to(k_flat.dtype)
+            v_flat[block_mapping] = v.to(v_flat.dtype)
+            # q/k/v 统一 cast 到 cache dtype (WSL2 上 q_proj/k_proj 可能输出 float32)
+            q = q.to(k_flat.dtype)
+            k = k.to(k_flat.dtype)
+            v = v.to(k_flat.dtype)
 
         # 始终从 cache 读 (含刚写入的 K/V), flash_attn 通过 block_tables 寻址
         o = flash_attn_varlen_func(
@@ -590,16 +601,17 @@ class Qwen3Attention(nn.Module):
             k_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
             v_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
             if slot_mapping is not None:
-                k_flat[slot_mapping] = k_new
-                v_flat[slot_mapping] = v_new
+                k_flat[slot_mapping] = k_new.to(k_flat.dtype)
+                v_flat[slot_mapping] = v_new.to(v_flat.dtype)
             else:
                 for i in range(batch):
                     pos = context_lens[i].item()
                     blk = block_tables[i, pos // 256].item()
                     off = pos % 256
                     idx = blk * 256 + off
-                    k_flat[idx] = k_new[i]
-                    v_flat[idx] = v_new[i]
+                    k_flat[idx] = k_new[i].to(k_flat.dtype)
+                    v_flat[idx] = v_new[i].to(v_flat.dtype)
+            q = q.to(k_flat.dtype)
 
         # flash_attn 从 cache 读历史 K/V（靠 block_table 寻址）
         o = flash_attn_with_kvcache(
@@ -728,8 +740,9 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # tie_word_embeddings：lm_head 和 embedding 共享权重
+        # 只替换 .data (和 nano-vllm 一样), 避免孤儿 tensor 浪费显存
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(self, x):
         h = self.model(x)                      # [batch, seq, hidden_size]
@@ -904,12 +917,16 @@ class Qwen3ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        warmup_tokens = 256
+        # 直接用最大 chunk 长度做 warmup，和 nano-vllm 一样，不需要外推
+        warmup_tokens = 2048
         dummy = torch.randint(0, self.config.vocab_size, (1, warmup_tokens), device='cuda')
         with torch.no_grad():
             _ = self.forward(dummy)
+        del _, dummy
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # WSL2 上第二次释放更彻底
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -917,24 +934,17 @@ class Qwen3ForCausalLM(nn.Module):
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         peak_act = peak - current
 
-        # 线性外推到 MAX_TOKENS_PER_STEP (generate_continuous 的 chunk 上限)
-        scale = 2048 / warmup_tokens   # 8x
-        peak_act = int(peak_act * scale)
-
         attn0 = self.model.layers[0].self_attn
         block_bytes = (2 * len(self.model.layers) * self.BLOCK_SIZE *
                        attn0.num_kv_heads * attn0.head_dim * 2)
 
-        if peak_act < 10 * 1024 * 1024:  # < 10MB — WSL2 bug, 切换到保守模式
-            available = int(total * gpu_memory_utilization - used - free * 0.3)
-        else:
-            available = int(total * gpu_memory_utilization - used - peak_act)
-
+        available = int(total * gpu_memory_utilization - used - peak_act)
         num_blocks = max(available // block_bytes, 1)
 
-        print(f"  KV Cache 动态分配: GPU={total/1e9:.1f}GB, "
-              f"peak_act={peak_act/1e6:.0f}MB"
-              f"{' (WSL2 fallback)' if peak_act < 10*1024*1024 else ''}, "
+        print(f"  KV Cache: total={total/1e9:.2f}GB, used={used/1e6:.0f}MB, "
+              f"peak_act={peak_act/1e6:.0f}MB (peak={peak/1e6:.0f}MB, "
+              f"current={current/1e6:.0f}MB)")
+        print(f"    budget={available/1e6:.0f}MB, block_bytes={block_bytes/1e6:.1f}MB, "
               f"blocks={num_blocks} ({num_blocks * self.BLOCK_SIZE} tokens)")
         return num_blocks
 
@@ -1412,6 +1422,10 @@ def bench(model, config):
     print(f"VRAM: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
 
+# 模块级配置：import 时生效，确保模型/cache 都是 bf16 + CUDA
+torch.set_default_dtype(torch.bfloat16)
+torch.set_default_device('cuda')
+
 if __name__ == '__main__':
     # ===== 端到端推理测试 =====
     import sys
@@ -1425,8 +1439,6 @@ if __name__ == '__main__':
 
     # 2. 加载模型
     print("加载模型...")
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device('cuda')
 
     config = Qwen3Config.from_json(f"{model_path}/config.json")
     model = Qwen3ForCausalLM(config)
