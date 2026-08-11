@@ -1,6 +1,6 @@
 # qwen3-naive-inference
 
-纯 PyTorch + Flash Attention，零推理框架依赖，跑通 Qwen3-0.6B 真实对话模型。已实现 varlen 多 prompt 批处理、Continuous Batching、Paged Attention、Prefix Caching，以及 GRPO 训练循环。
+纯 PyTorch + Flash Attention，零推理框架依赖，跑通 Qwen3-0.6B 真实对话模型。已实现 Varlen 批处理、Continuous Batching、Paged Attention、Prefix Caching、Chunked Prefill、CUDA Graph、动态 KV Cache 分配、LIFO Preemption，以及 GRPO 训练循环。
 
 **不需要 HuggingFace 的模型代码，不需要推理框架。有 config.json + model.safetensors + PyTorch 就能跑。**
 
@@ -335,20 +335,34 @@ num_seqs = min(max_num_batched_tokens // seq_len, max_num_seqs)  # 默认: 4
 # 跑 4 × 4096 = 16384 token 同时 forward
 ```
 
-### 我们当前的实现：硬编码
+### 我们的实现：动态分配 + WSL2 兼容
 
 ```python
-# qwen3_naive.py — 写死 block 数量
-NUM_BLOCKS = 64
-BLOCK_SIZE = 256
+# qwen3_naive.py — _compute_num_blocks
+torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats()
+
+# Warmup: 256-token 前向传播 → 线性外推到 2048 (max chunk size)
+dummy = torch.randint(0, vocab_size, (1, 256))
+_ = self.forward(dummy)
+torch.cuda.empty_cache()
+
+free, total = torch.cuda.mem_get_info()
+used   = total - free
+peak   = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+peak_act = (peak - current) * 8     # 256 → 2048 缩放
+
+available = total * 0.9 - used - peak_act
+num_blocks = max(available // block_bytes, 1)
 ```
 
-不足：
-- 不检查显存是否够用
-- 换显卡（如 4090 24GB）不会自动利用更多显存
-- 如果 64 blocks × 1.88 GB > 剩余显存，启动即 OOM
+**和 nano-vllm 的差异**：
+- nano-vllm warmup 用完整的 2048-token batch（更准但显存消耗大）
+- 我们用 256 tokens + ×8 缩放（更轻量，4GB 卡上不 OOM）
+- WSL2 下 `memory_stats()` 可能返回 < 10MB 的异常值，自动切换到保守模式（预留 30% 空闲显存）
 
-下一步应该参考 nano-vllm 的动态分配，加载模型后跑 warmup → 测 `peak - current` → 计算安全的 `NUM_BLOCKS`。
+**实测 (RTX 4090 50GB)**：peak_act=78MB → 缩放后 624MB，分配 ~982 blocks。
 
 ## GRPO 训练
 
@@ -368,28 +382,68 @@ CLIP_EPSILON = 0.2    # PPO clip 范围
 TEMPERATURE = 0.8     # RL 用高温度鼓励探索
 ```
 
-## Benchmark（RTX 3050 Ti 4GB）
+## Benchmark
 
-| 配置 | 吞吐 | 说明 |
+### RTX 4090 48GB — 我们的引擎 vs nano-vllm
+
+64 条随机序列批处理 (input≤512, output=256, Qwen3-0.6B)：
+
+| 引擎 | 吞吐 | 备注 |
 |------|------|------|
-| naive（无 KV-cache），1 seq | ~3.4 tok/s | 每步完整 forward，二次复杂度 |
-| varlen batch（无 KV-cache），4 seqs | ~6.3 tok/s | 多 prompt 零填充批处理 |
-| Continuous Batching + Paged，4 seqs | ~22.8 tok/s | KV cache + 批处理 + 页表管理 |
-| nano-vllm（完整工程化） | ~41 tok/s | CUDA Graph + 更多 kernel 优化 |
+| **我们的引擎** | **3399.9 tok/s** | Chunked Prefill + CUDA Graph + Varlen batch prefill |
+| nano-vllm | 2539.9 tok/s | enforce_eager=True（PyTorch 2.12.1 `@torch.compile` inductor bug） |
+
+我们的引擎快 **34%**。优势来自统一的 varlen prefill 路径和 CUDA Graph。
+
+### RTX 3050 Ti 4GB — 开发卡
+
+| 配置 | 吞吐 |
+|------|------|
+| naive（无 KV-cache），1 seq | ~3.4 tok/s |
+| varlen batch，4 seqs | ~6.3 tok/s |
+| Continuous Batching + Paged，4 seqs | ~22.8 tok/s |
+
+## 关键设计决策
+
+### can_append/may_append 用 kv_len 而非 num_tokens
+
+`num_tokens` = 序列中已有 token 数（含已采样的）。`kv_len` = KV cache 中实际写入的 token 数。
+
+采样后 `num_tokens = kv_len + 1`，下一轮 decode 前 `can_append` 判断边界时应该用 `kv_len`：
+
+```python
+# ❌ 之前: num_tokens
+need = seq.num_tokens % 256 == 0    # num_tokens=257 → 257%256=1 → 不加块 → 崩!
+
+# ✅ 现在: kv_len
+need = seq.kv_len % 256 == 0        # kv_len=256 → 256%256=0 → 加块 → OK
+```
+
+这个 bug 在 prompt 恰好 256 倍数时必现。手动步进测试能过但 `generate_continuous` 里崩，因为 `may_append` 被 LIFO preemption 改动错放进条件分支了。
+
+### CUDA Graph 实现
+
+直接调 `torch.cuda.CUDAGraph()` 底层 API（不经过 `@torch.compile`），为 bs=[1,2,4,8,16,32,48,64] 各录制一个图，所有图共享一个 memory pool。decode-only batch 时优先 `graph.replay()`，失败回退 eager。
+
+**和 nano-vllm 的差异**：nano-vllm 用 `@torch.compile` 触发 CUDA Graph，对 PyTorch 版本敏感（2.12.1 的 inductor bug 导致崩溃）。我们直接调底层 API，不受影响。
+
+### Preemption: LIFO 策略
+
+缺块时驱逐 `running[-1]`（最新加入/生成进度最少的序列），保护已生成多步的老同志。单序列场景下退化为踢自己（和 nano-vllm 一样，此时无解）。
 
 ## 优化路线图
 
-| 优先级 | 优化 | 提速/效果 | 状态 |
-|--------|------|-----------|------|
-| P0 | KV-Cache（单序列） | ~10× | ✅ `generate_kvcache` |
-| P1 | Varlen 多 Prompt 批处理 | ~2× | ✅ `generate_varlen` |
-| P2 | Continuous Batching + Paged Attention | ~3× + 省显存 | ✅ `generate_continuous` |
-| P3 | 动态 KV Cache 分配（warmup 测 peak） | 适配不同显卡 | ❌ 当前硬编码 `NUM_BLOCKS=64` |
-| P4 | Chunked Prefill | 避免长 prompt 显存峰值 | ❌ |
-| P5 | Preemption（显存不足时驱逐序列） | 提高并发上限 | ❌ |
-| P6 | Prefix Caching（hash 检测公共前缀） | 省显存 + 省 prefill 计算 | ✅ `BlockManager` 链式 hash + 引用计数 |
-| P7 | torch.compile | ~1.3× | ❌ |
-| P8 | CUDA Graph | 减少 kernel launch 开销 | ❌ |
+| 优先级 | 优化 | 状态 |
+|--------|------|------|
+| P0 | KV-Cache（单序列） | ✅ |
+| P1 | Varlen 多 Prompt 批处理 | ✅ |
+| P2 | Continuous Batching + Paged Attention | ✅ |
+| P3 | 动态 KV Cache 分配（warmup + WSL2 fallback） | ✅ |
+| P4 | Chunked Prefill | ✅ |
+| P5 | Preemption（LIFO 驱逐） | ✅ |
+| P6 | Prefix Caching（链式 hash + 引用计数） | ✅ |
+| P7 | torch.compile | ❌ |
+| P8 | CUDA Graph（16 个 bs 图 + graph.replay） | ✅ |
 
 ## 参考
 

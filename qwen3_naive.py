@@ -231,13 +231,16 @@ class BlockManager:
     # decode 时按需追加 block
     # ================================================================
     def can_append(self, seq: Sequence) -> bool:
-        """是否需要新块 + 是否还有空闲"""
-        need = seq.num_tokens % self.block_size == 0
+        """是否需要新块 + 是否还有空闲
+
+        判断基准是 kv_len (下一个要写入的 K/V 位置), 不是 num_tokens。
+        因为采样后 num_tokens = kv_len + 1, 而 K/V 写入位置是 kv_len。"""
+        need = seq.kv_len % self.block_size == 0
         return (not need) or len(self.free) > 0
 
     def may_append(self, seq: Sequence):
         """需要就追加, 并管理 ref_count + 清除旧 hash"""
-        if seq.num_tokens % self.block_size == 0:
+        if seq.kv_len % self.block_size == 0:
             blk = self.free.pop()
             if self.block_hash[blk] != -1:
                 old_h = self.block_hash[blk]
@@ -914,6 +917,10 @@ class Qwen3ForCausalLM(nn.Module):
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         peak_act = peak - current
 
+        # 线性外推到 MAX_TOKENS_PER_STEP (generate_continuous 的 chunk 上限)
+        scale = 2048 / warmup_tokens   # 8x
+        peak_act = int(peak_act * scale)
+
         attn0 = self.model.layers[0].self_attn
         block_bytes = (2 * len(self.model.layers) * self.BLOCK_SIZE *
                        attn0.num_kv_heads * attn0.head_dim * 2)
@@ -1134,9 +1141,10 @@ class Qwen3ForCausalLM(nn.Module):
         self.allocate_global_kv_cache()           # 触发 warmup, 设置 _num_blocks
         bm = BlockManager(self._num_blocks, self.BLOCK_SIZE)
 
-        # 初始化 CUDA Graph (decode 加速)
-        self._init_cuda_graphs()
-        self._capture_decode_graphs()
+        # 初始化 CUDA Graph (只做一次, 避免重复捕获污染 KV cache)
+        if not getattr(self, '_has_cuda_graphs', False):
+            self._init_cuda_graphs()
+            self._capture_decode_graphs()
 
         # 用 prompt_ids_list 创建 Sequence
         waiting: list[Sequence] = []
@@ -1185,8 +1193,8 @@ class Qwen3ForCausalLM(nn.Module):
 
                         if seq.status == "WAITING":   # seq 被踢了
                             continue
-                        # 别人被踢, seq 现在有块了
-                        bm.may_append(seq)
+
+                    bm.may_append(seq)                   # 正常情况 + LIFO 踢别人后都需要
                     seq.num_scheduled_tokens = 1
                 else:
                     # ── MID-PREFILL 序列 ──
