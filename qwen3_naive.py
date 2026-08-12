@@ -156,6 +156,7 @@ class Sequence:
         sp = sampling_params or {}
         self.temperature = sp.get("temperature", 0.6)
         self.max_tokens = sp.get("max_tokens", 256)
+        self.response_log_probs: list[float] = []  # GRPO: 每个 response token 采样时的 logP
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
@@ -654,9 +655,16 @@ class Qwen3MLP(nn.Module):
         self.gate_up_proj = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
+    @torch.compile
+    def _silu_and_mul(self, gate_up):
+        """将 chunk + silu + mul 融合为一个编译 kernel, 减少 kernel launch 开销"""
+        gate, up = gate_up.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
     def forward(self, x):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(torch.nn.functional.silu(gate) * up)
+        gate_up = self.gate_up_proj(x)
+        hidden = self._silu_and_mul(gate_up)
+        return self.down_proj(hidden)
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -1098,7 +1106,8 @@ class Qwen3ForCausalLM(nn.Module):
         bufs["context_lens"][:bs] = context_lens
         bufs["block_tables"][:bs, :block_tables.shape[1]] = block_tables
         self._graphs[graph_bs].replay()
-        return bufs["outputs"][:bs].clone()
+        # 不 clone: lm_head 立刻消费输出, 下一次 replay 才会覆盖 pool 内存
+        return bufs["outputs"][:bs]
 
     def _prepare_step(self, seqs: list[Sequence]):
         """统一准备混合 batch (prefill chunk + decode): 构建 varlen 输入和 block_mapping。
@@ -1239,6 +1248,9 @@ class Qwen3ForCausalLM(nn.Module):
                             bm.deallocate(victim.block_table)
                             victim.block_table.clear()
                             victim.kv_len = 0
+                            # preempt 后从 prompt 重新开始, 清除已生成的 token
+                            victim.token_ids = victim.token_ids[:victim.num_prompt_tokens]
+                            victim.response_log_probs.clear()
                             running.pop()             # 弹出末尾 (LIFO)
                             waiting.insert(0, victim)
 
@@ -1379,6 +1391,208 @@ class Qwen3ForCausalLM(nn.Module):
         results = [(s.token_ids, s.token_ids[s.num_prompt_tokens:]) for s in all_seqs]
         seq_tokens, all_generated = zip(*results)
         return list(seq_tokens), list(all_generated)
+
+    @torch.no_grad()
+    def generate_continuous_with_logprobs(self, prompt_ids_list, max_new_tokens=256,
+                                          temperature=0.6, top_k=20, eos_token_ids=None):
+        """
+        Continuous Batching + Chunked Prefill，同时记录每个 response token 的 logP。
+
+        与 generate_continuous 的调度逻辑完全一致，区别在于:
+          1. 采样后额外计算 log_softmax，记录选中 token 的 logP
+          2. 返回值多出 all_log_probs 和 prompt_lens
+
+        返回:
+          seq_tokens:     list[list[int]]   每条序列的完整 token IDs
+          all_generated:  list[list[int]]   每条序列新生成的 token IDs
+          all_log_probs:  list[list[float]] 每条序列每个 response token 的 logP
+          prompt_lens:    list[int]         每条序列的 prompt 长度
+        """
+        MAX_TOKENS_PER_STEP = 2048
+
+        self.allocate_global_kv_cache()
+        bm = BlockManager(self._num_blocks, self.BLOCK_SIZE)
+
+        if not getattr(self, '_has_cuda_graphs', False):
+            self._init_cuda_graphs()
+            self._capture_decode_graphs()
+
+        waiting: list[Sequence] = []
+        for pids in prompt_ids_list:
+            token_ids = pids[0].tolist()
+            waiting.append(Sequence(token_ids, {"temperature": temperature, "max_tokens": max_new_tokens}))
+
+        running: list[Sequence] = []
+        all_seqs = list(waiting)
+
+        while waiting or running:
+            all_scheduled = []
+            budget = MAX_TOKENS_PER_STEP
+
+            # ============================================================
+            # Step 1: 遍历 running — decode 优先，mid-prefill 继续吃预算
+            # ============================================================
+            i = 0
+            while i < len(running) and budget > 0:
+                seq = running[i]
+
+                if seq.kv_len >= seq.num_prompt_tokens:
+                    # ── DECODE ──
+                    if seq.num_completion_tokens >= seq.max_tokens:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.pop(i)
+                        continue
+
+                    if not bm.can_append(seq):
+                        while not bm.can_append(seq):
+                            victim = running[-1]
+                            victim.status = "WAITING"
+                            bm.deallocate(victim.block_table)
+                            victim.block_table.clear()
+                            victim.kv_len = 0
+                            victim.token_ids = victim.token_ids[:victim.num_prompt_tokens]
+                            victim.response_log_probs.clear()
+                            running.pop()
+                            waiting.insert(0, victim)
+                            if victim is seq:
+                                break
+                        if seq.status == "WAITING":
+                            continue
+
+                    bm.may_append(seq)
+                    seq.num_scheduled_tokens = 1
+                else:
+                    # ── MID-PREFILL ──
+                    remaining = seq.num_prompt_tokens - seq.kv_len
+                    seq.num_scheduled_tokens = min(remaining, budget)
+
+                all_scheduled.append(seq)
+                budget -= seq.num_scheduled_tokens
+                i += 1
+
+            # ============================================================
+            # Step 2: 用剩余 budget 拉 waiting
+            # ============================================================
+            while waiting and budget > 0:
+                seq = waiting[0]
+
+                if not seq.block_table:
+                    if bm.available < seq.num_blocks:
+                        break
+                    bm.allocate(seq)
+
+                waiting.pop(0)
+                seq.status = "RUNNING"
+                running.append(seq)
+
+                remaining = seq.num_prompt_tokens - seq.kv_len
+                if remaining <= budget:
+                    seq.num_scheduled_tokens = remaining
+                elif len(all_scheduled) == 0:
+                    seq.num_scheduled_tokens = budget
+                else:
+                    waiting.insert(0, seq)
+                    running.pop()
+                    break
+
+                all_scheduled.append(seq)
+                budget -= seq.num_scheduled_tokens
+
+            if not all_scheduled:
+                continue
+
+            # ============================================================
+            # Step 3: Forward
+            # ============================================================
+            all_decode = all(s.num_scheduled_tokens == 1 for s in all_scheduled)
+
+            if all_decode:
+                input_ids, pos, ctx_lens, block_tables, slot_mapping = self._prepare_decode(all_scheduled)
+                bs = len(all_scheduled)
+                h = None
+                if self._has_cuda_graphs:
+                    h = self._run_decode_graph(
+                        bs, input_ids, pos, ctx_lens,
+                        block_tables, slot_mapping,
+                    )
+                if h is None:
+                    h = self.model.forward_decode(
+                        input_ids, pos, ctx_lens, block_tables, slot_mapping,
+                    )
+            else:
+                input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables = self._prepare_step(all_scheduled)
+                h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables)
+
+            logits = self.lm_head(h)
+
+            # ============================================================
+            # Step 4: 更新 kv_len + hash blocks
+            # ============================================================
+            for seq in all_scheduled:
+                seq.kv_len += seq.num_scheduled_tokens
+                bm.hash_blocks(seq)
+
+            # ============================================================
+            # Step 5: 条件采样 + 记录 logP
+            # ============================================================
+            sample_indices = []
+            offset = 0
+            for seq in all_scheduled:
+                if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
+                    sample_indices.append(offset + seq.num_scheduled_tokens - 1)
+                offset += seq.num_scheduled_tokens
+
+            if sample_indices:
+                last_logits = logits[sample_indices].float()
+            else:
+                for seq in all_scheduled:
+                    seq.num_scheduled_tokens = 0
+                continue
+
+            last_logits = last_logits / temperature
+            if top_k is not None:
+                topk_vals, topk_idx = torch.topk(last_logits, top_k, dim=-1)
+                neg_inf = torch.tensor(float('-inf'), dtype=last_logits.dtype, device=last_logits.device)
+                filtered = torch.full_like(last_logits, neg_inf)
+                last_logits = filtered.scatter(-1, topk_idx, topk_vals)
+
+            probs = torch.softmax(last_logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)   # [N_sample, 1]
+
+            # ★ GRPO 关键: 记录采样 token 的 logP
+            log_probs_all = torch.log_softmax(last_logits, dim=-1)         # [N_sample, vocab]
+            sampled_log_probs = log_probs_all.gather(-1, next_tokens)      # [N_sample, 1]
+
+            # ---- 更新序列状态 + 存储 logP ----
+            sample_idx = 0
+            for seq in all_scheduled:
+                if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
+                    token_id = next_tokens[sample_idx].item()
+                    seq.append_token(token_id)
+                    # 记录选中 token 的 log probability
+                    seq.response_log_probs.append(sampled_log_probs[sample_idx].item())
+                    sample_idx += 1
+
+                    if eos_token_ids is not None and token_id in eos_token_ids:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.remove(seq)
+                    elif seq.num_completion_tokens >= seq.max_tokens:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.remove(seq)
+
+                seq.num_scheduled_tokens = 0
+
+        # 返回 4 元组: token IDs, 新生成部分, logP, prompt 长度
+        results = [(s.token_ids, s.token_ids[s.num_prompt_tokens:],
+                    s.response_log_probs, s.num_prompt_tokens) for s in all_seqs]
+        seq_tokens, all_generated, all_log_probs, prompt_lens = zip(*results)
+        return list(seq_tokens), list(all_generated), list(all_log_probs), list(prompt_lens)
 
 
 def load_weights(model, checkpoint_path):
