@@ -1334,27 +1334,38 @@ class Qwen3ForCausalLM(nn.Module):
             # ============================================================
             # Step 4: 更新 kv_len + hash blocks
             # ============================================================
-            for seq in all_scheduled:
-                seq.kv_len += seq.num_scheduled_tokens
-                bm.hash_blocks(seq)
+            # 快速路径: decode 不跨 block, hash_blocks 立即返回
+            if all_decode:
+                for seq in all_scheduled:
+                    seq.kv_len += 1
+            else:
+                for seq in all_scheduled:
+                    seq.kv_len += seq.num_scheduled_tokens
+                    bm.hash_blocks(seq)
 
             # ============================================================
             # Step 5: 条件采样 — 仅 prefill 完成 或 decode
             # ============================================================
-            sample_indices = []
-            offset = 0
-            for seq in all_scheduled:
-                if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
-                    sample_indices.append(offset + seq.num_scheduled_tokens - 1)
-                offset += seq.num_scheduled_tokens
-
-            if sample_indices:
-                last_logits = logits[sample_indices].float()
+            n_scheduled = len(all_scheduled)
+            # 快速路径: 纯 decode step, 所有序列都需要采样
+            if all_decode:
+                last_logits = logits[:n_scheduled].float()
+                sample_indices = list(range(n_scheduled))
             else:
-                # 所有 seq 都是 mid-prefill, 不采样
+                sample_indices = []
+                offset = 0
                 for seq in all_scheduled:
-                    seq.num_scheduled_tokens = 0
-                continue
+                    if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
+                        sample_indices.append(offset + seq.num_scheduled_tokens - 1)
+                    offset += seq.num_scheduled_tokens
+
+                if sample_indices:
+                    last_logits = logits[sample_indices].float()
+                else:
+                    # 所有 seq 都是 mid-prefill, 不采样
+                    for seq in all_scheduled:
+                        seq.num_scheduled_tokens = 0
+                    continue
 
             last_logits = last_logits / temperature
             if top_k is not None:
@@ -1366,13 +1377,14 @@ class Qwen3ForCausalLM(nn.Module):
             probs = torch.softmax(last_logits, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1)   # [N_sample, 1]
 
+            # ★ 批量 GPU→CPU: .tolist() 全量同步一次, 而非逐 .item()
+            token_list = next_tokens.tolist()
+
             # ---- 更新采样后的序列状态 ----
-            sample_idx = 0
-            for seq in all_scheduled:
-                if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
-                    token_id = next_tokens[sample_idx].item()
+            # 快速路径: decode step 下所有序列都需要处理, 跳过条件判断
+            if all_decode:
+                for seq, (token_id,) in zip(all_scheduled, token_list):
                     seq.append_token(token_id)
-                    sample_idx += 1
 
                     if eos_token_ids is not None and token_id in eos_token_ids:
                         seq.status = "FINISHED"
@@ -1385,7 +1397,7 @@ class Qwen3ForCausalLM(nn.Module):
                         seq.block_table.clear()
                         running.remove(seq)
 
-                seq.num_scheduled_tokens = 0   # reset
+                    seq.num_scheduled_tokens = 0   # reset
 
         # 返回结果
         results = [(s.token_ids, s.token_ids[s.num_prompt_tokens:]) for s in all_seqs]
@@ -1530,9 +1542,14 @@ class Qwen3ForCausalLM(nn.Module):
             # ============================================================
             # Step 4: 更新 kv_len + hash blocks
             # ============================================================
-            for seq in all_scheduled:
-                seq.kv_len += seq.num_scheduled_tokens
-                bm.hash_blocks(seq)
+            # 快速路径: decode 不跨 block, hash_blocks 立即返回
+            if all_decode:
+                for seq in all_scheduled:
+                    seq.kv_len += 1
+            else:
+                for seq in all_scheduled:
+                    seq.kv_len += seq.num_scheduled_tokens
+                    bm.hash_blocks(seq)
 
             # ============================================================
             # Step 5: 条件采样 + 记录 logP
