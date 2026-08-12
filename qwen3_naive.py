@@ -1129,18 +1129,25 @@ class Qwen3ForCausalLM(nn.Module):
             max_seqlen_q = max(max_seqlen_q, new_tokens)
             max_seqlen_k = max(max_seqlen_k, end)
 
-            # 为新 token 构建 block_mapping (写入 cache)
-            for pos in range(start, end):
-                blk = seq.block_table[pos // self.BLOCK_SIZE]
-                off = pos % self.BLOCK_SIZE
-                block_mapping.append(blk * self.BLOCK_SIZE + off)
+            # 为新 token 构建 block_mapping (写入 cache) — 逐 block 而非逐 token
+            start_blk = start // self.BLOCK_SIZE
+            end_blk = (end + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
+            for blk_idx in range(start_blk, end_blk):
+                slot_start = seq.block_table[blk_idx] * self.BLOCK_SIZE
+                if blk_idx == start_blk:
+                    slot_start += start % self.BLOCK_SIZE
+                if blk_idx == end_blk - 1:
+                    slot_end = seq.block_table[blk_idx] * self.BLOCK_SIZE + end - blk_idx * self.BLOCK_SIZE
+                else:
+                    slot_end = seq.block_table[blk_idx] * self.BLOCK_SIZE + self.BLOCK_SIZE
+                block_mapping.extend(range(slot_start, slot_end))
 
-        device = 'cuda'
-        input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
-        positions = torch.tensor(positions, dtype=torch.long, device=device)
-        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
-        cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
-        blk_map = torch.tensor(block_mapping, dtype=torch.int32, device=device)
+        # pin_memory + non_blocking: CPU→GPU 异步传输, 和 GPU kernel 重叠
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        blk_map = torch.tensor(block_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         # 始终构建 block_tables (混合 batch 必须, decode-only 也必须)
         block_tables = self._build_block_tables(seqs)
@@ -1148,25 +1155,19 @@ class Qwen3ForCausalLM(nn.Module):
         return input_ids, positions, cu_q, cu_k, max_seqlen_q, max_seqlen_k, blk_map, block_tables
 
     def _build_block_tables(self, seqs: list[Sequence]):
-        """构建 block_tables tensor: [batch, max_blocks], 短序列填 -1"""
+        """构建 block_tables tensor: [batch, max_blocks], 短序列填 -1。一次拼接，一次 GPU 拷贝。"""
         max_blocks = max(len(s.block_table) for s in seqs)
-        bt = torch.full((len(seqs), max_blocks), -1, dtype=torch.int32, device='cuda')
-        for i, s in enumerate(seqs):
-            bt[i, :len(s.block_table)] = torch.tensor(s.block_table, dtype=torch.int32, device='cuda')
-        return bt
+        rows = [s.block_table + [-1] * (max_blocks - len(s.block_table)) for s in seqs]
+        return torch.tensor(rows, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     def _prepare_decode(self, seqs: list[Sequence]):
         """构建 decode 输入：block_tables + slot_mapping 用于 flash_attn + CUDA Graph"""
-        device = 'cuda'
-        input_ids = torch.tensor([s.last_token for s in seqs], dtype=torch.long, device=device)
-        positions = torch.tensor([s.num_tokens - 1 for s in seqs], dtype=torch.long, device=device)
-        context_lens = torch.tensor([s.kv_len for s in seqs], dtype=torch.int32, device=device)
+        input_ids = torch.tensor([s.last_token for s in seqs], dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor([s.num_tokens - 1 for s in seqs], dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor([s.kv_len for s in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-        # block_tables: [batch, max_blocks]  短序列填 -1
-        max_blocks = max(len(s.block_table) for s in seqs)
-        bt = torch.full((len(seqs), max_blocks), -1, dtype=torch.int32, device=device)
-        for i, s in enumerate(seqs):
-            bt[i, :len(s.block_table)] = torch.tensor(s.block_table, dtype=torch.int32, device=device)
+        # block_tables: [batch, max_blocks], 短序列填 -1。一次拼接，一次 GPU 拷贝
+        bt = self._build_block_tables(seqs)
 
         # slot_mapping: 每个新 token 写入 cache 的物理地址
         slot_mapping = []
@@ -1175,7 +1176,7 @@ class Qwen3ForCausalLM(nn.Module):
             blk = s.block_table[pos // self.BLOCK_SIZE]
             off = pos % self.BLOCK_SIZE
             slot_mapping.append(blk * self.BLOCK_SIZE + off)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         return input_ids, positions, context_lens, bt, slot_mapping
 
