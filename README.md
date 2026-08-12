@@ -401,6 +401,25 @@ TEMPERATURE = 0.8     # RL 用高温度鼓励探索
 
 ## Benchmark
 
+### RTX 3090 24GB — 我们的引擎 vs nano-vllm
+
+48 条随机序列 (input=50~128, output=50~64, Qwen3-0.6B)：
+
+| 引擎 | 吞吐 | 平均耗时 | VRAM | 备注 |
+|------|------|----------|------|------|
+| **我们的引擎** | **2,974 tok/s** | 0.92s | 22.9 GB | `generate_continuous`: Continuous Batching + CUDA Graph + Chunked Prefill |
+| nano-vllm | 1,530 tok/s | 1.78s | 20.9 GB | `enforce_eager=True`（无 CUDA Graph） |
+| 我们的 `generate_naive` | 20.8 tok/s | 131.6s | 1.5 GB | 无 KV cache，每步完整 forward（对照组） |
+
+我们的引擎快 **1.94x**。关键优势：
+
+1. **CUDA Graph** — 捕获 8 个 batch size 的 decode graph (bs=[1,2,4,8,16,32,48,64])，省去 kernel launch 开销。首次 Run 即达到 2,936 tok/s，nano-vllm 首次仅 941 tok/s
+2. **Triton `store_kvcache`** — 写入 KV cache 零中间 tensor、零 dtype cast
+3. **Fused residual add + RMSNorm** — 残差加法和归一化融合为一个 kernel
+4. **混合 batch 统一 prefill 路径** — prefill 和 decode 可在同一 batch 混合执行，减少 bubble
+
+> 注：`generate_naive` 比 `generate_continuous` 慢 **143x**（20.8 vs 2,974 tok/s），差距来自 KV cache（避免重算全历史）和 continuous batching（并行处理多序列）。
+
 ### RTX 4090 48GB — 我们的引擎 vs nano-vllm
 
 64 条随机序列批处理 (input≤512, output=256, Qwen3-0.6B)：
@@ -448,6 +467,119 @@ need = seq.kv_len % 256 == 0        # kv_len=256 → 256%256=0 → 加块 → OK
 
 缺块时驱逐 `running[-1]`（最新加入/生成进度最少的序列），保护已生成多步的老同志。单序列场景下退化为踢自己（和 nano-vllm 一样，此时无解）。
 
+## TP-2 分布式推理
+
+`qwen3_distributed.py` — 基于 `qwen3_naive.py` 的 Tensor Parallelism (TP-2) 分布式推理引擎，在 2 张 GPU 上切分模型权重和 KV Cache，支持 Continuous Batching + Chunked Prefill。
+
+### 架构概览
+
+```
+Master-Worker 模式:
+  Rank 0 (Master):     调度 + 采样 + 序列状态管理
+  Rank 1 (Worker):     纯计算
+
+每个 step:
+  1. [rank 0]     调度: 管理 waiting/running, BlockManager
+  2. [rank 0→all] broadcast 元数据 (input_ids, positions, block_tables, ...)
+  3. [all ranks]  forward (内含 TP 通信: all-reduce, all-gather)
+  4. [all ranks]  all-gather logits → rank 0 采样
+  5. [rank 0]     更新 Sequence 状态
+```
+
+### TP-2 切分方案
+
+| 维度 | GPU0 | GPU1 |
+|------|------|------|
+| Attention heads | Q heads 0-7, KV heads 0-3 | Q heads 8-15, KV heads 4-7 |
+| Hidden dim | [0:512] | [512:1024] |
+| Intermediate dim | [0:1536] | [1536:3072] |
+| Vocab (lm_head) | [0:75968] | [75968:151936] |
+
+### 分布式组件
+
+| 类名 | 原类 | TP 改造 |
+|------|------|---------|
+| `ColumnParallelLinear` | `nn.Linear` | 沿 output dim 切分，gather_output=True 时自动 all-gather |
+| `RowParallelLinear` | `nn.Linear` | 沿 input dim 切分，forward 后自动 all-reduce |
+| `DistributedQwen3Attention` | `Qwen3Attention` | QKV→ColumnParallel, O→RowParallel, KV cache 按 head 分片 |
+| `DistributedQwen3MLP` | `Qwen3MLP` | gate/up→ColumnParallel, down→RowParallel |
+| `DistributedQwen3DecoderLayer` | `Qwen3DecoderLayer` | 使用 distributed attention + MLP |
+| `DistributedQwen3Model` | `Qwen3Model` | embed_tokens 复制，layers 用 distributed 版本 |
+| `DistributedQwen3ForCausalLM` | `Qwen3ForCausalLM` | lm_head→ColumnParallel(vocab dim)，logits 需 all-gather |
+
+### 通信模式
+
+| 位置 | 通信 | 说明 |
+|------|------|------|
+| RowParallelLinear (o_proj, down_proj) | `all_reduce(output)` | 聚合每个 GPU 的部分和 |
+| lm_head | `all_gather(logits)` | 收集完整 logits 用于采样 |
+| Scheduler 决策 | `broadcast(tensors)` | rank 0→all: token_ids, positions, block_tables 等 |
+
+**不需要通信的地方：**
+- **RMSNorm**：RowParallelLinear 已经 all-reduce 了 hidden state，各 GPU 的 hidden 值一致
+- **QK-Norm**：每个 head 独立归一化，head 不分片，不需要通信
+- **RoPE**：每个 head 独立做旋转编码，不需要通信
+- **KV Cache 读取**：每个 GPU 只读本地分片的 KV heads，`flash_attn_with_kvcache` 内部按 `cache_seqlens` 寻址
+
+### GQA 在 TP-2 下的处理
+
+原始的 GQA 配置（16 Q heads : 8 KV heads，比例 2:1）在 TP-2 下自动保持：
+
+```
+GPU0: 8 Q heads, 4 KV heads  (Q:K = 2:1) ✅
+GPU1: 8 Q heads, 4 KV heads  (Q:K = 2:1) ✅
+```
+
+Q/K/V 投影权重按 head 维度切分，`flash_attn` 内部自动处理不同头数，无需手动 `_repeat_kv`。
+
+### 权重加载
+
+加载完整 checkpoint 后按 rank 切片：
+
+```python
+if tgt_shape[0] == src_shape[0]:
+    # RowParallel: input dim 被切 → 沿 dim 1 切片 (in_features)
+    param.data.copy_(tensor[:, start:end])
+elif tgt_shape[1] == src_shape[1]:
+    # ColumnParallel: output dim 被切 → 沿 dim 0 切片 (out_features)
+    param.data.copy_(tensor[start:end, :])
+```
+
+`embed_tokens` 权重在各 GPU 上保留完整副本（~155M params），占用可接受。
+
+### 运行命令
+
+```bash
+# 单机双卡 (需要 2 张 GPU)
+MODEL_PATH=/path/to/Qwen3-0.6B torchrun --nproc_per_node=2 qwen3_distributed.py
+
+# 单卡验证 (需要 NCCL_P2P_DISABLE=1 绕过 NCCL 2.21+ 的 duplicate GPU 检查)
+NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 qwen3_distributed.py
+```
+
+### 实测结果：2x RTX 3090 24GB
+
+| 指标 | 数值 |
+|------|------|
+| 模型参数 | 453,640,192 |
+| 单卡 VRAM（含模型） | 1.50 GB |
+| KV Cache 总预算 | 25.3 GB |
+| KV Cache blocks | 1,331 blocks (340,736 tokens 容量) |
+| 吞吐 (4 prompts, max 256 new tokens) | **54.3 tok/s** |
+| 生成结果正确性 | 4/4 prompts 生成合理中文回复 ✅ |
+
+4 条 prompt 在 Continuous Batching 下交织执行：prefill 阶段 varlen 拼接后一次 forward，decode 阶段逐 token 迭代，NCCL all-reduce/all-gather/broadcast 通信全部正常。
+
+### 关键设计决策
+
+1. **Master-Worker 而非全对等**：BlockManager 和 Sequence 状态只在 rank 0 维护，通过 broadcast 下发，避免跨 GPU 的分布式锁和一致性开销。
+
+2. **lm_head 用 ColumnParallel 而非 RowParallel**：vocab 维度大（151,936），ColumnParallel 各 GPU 计算自己负责的一半 logits，然后 all-gather 得到完整 logits。无需在 lm_head 后加 all-reduce。
+
+3. **Pre/Post Layer 的 hidden state 自动同步**：RowParallel 的 all-reduce 保证了 layer 输出的 hidden state 一致，RMSNorm 作为 element-wise op 不需要通信。
+
+4. **从 `qwen3_naive` import 不变组件**：`Qwen3Config`、`RotaryEmbedding`、`Sequence`、`BlockManager` 直接复用，不改动原文件。
+
 ## 优化路线图
 
 | 优先级 | 优化 | 状态 |
@@ -461,6 +593,7 @@ need = seq.kv_len % 256 == 0        # kv_len=256 → 256%256=0 → 加块 → OK
 | P6 | Prefix Caching（链式 hash + 引用计数） | ✅ |
 | P7 | torch.compile | ❌ |
 | P8 | CUDA Graph（16 个 bs 图 + graph.replay） | ✅ |
+| P9 | TP-2 分布式推理（Column/Row Parallel + NCCL 通信） | ✅ |
 
 ## 参考
 

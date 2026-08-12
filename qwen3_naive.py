@@ -105,16 +105,26 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x, residual=None):
+    @torch.compile
+    def _rms_norm(self, x):
         orig_dtype = x.dtype
         x_f32 = x.float()
-        if residual is not None:
-            # Fused: add residual + norm 一个 kernel 完成, 省一次显存读写
-            x_f32 = x_f32 + residual.float()
-            residual = x_f32.to(orig_dtype)
         x_f32 = x_f32 * torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        out = (x_f32 * self.weight.float()).to(orig_dtype)
-        return (out, residual) if residual is not None else out
+        return (x_f32 * self.weight.float()).to(orig_dtype)
+
+    @torch.compile
+    def _add_rms_norm(self, x, residual):
+        orig_dtype = x.dtype
+        x_f32 = x.float() + residual.float()
+        residual = x_f32.to(orig_dtype)
+        x_f32 = x_f32 * torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x_f32 * self.weight.float()).to(orig_dtype), residual
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            return self._rms_norm(x)
+        else:
+            return self._add_rms_norm(x, residual)
 
 
 class BadRMSNorm:
@@ -640,13 +650,13 @@ class Qwen3MLP(nn.Module):
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
-        # 分开的 gate 和 up 投影——和 checkpoint 名字对齐
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # Fused gate+up: 一次 matmul 出 gate 和 up, 省掉一次读 x 和一次 kernel launch
+        self.gate_up_proj = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(torch.nn.functional.silu(gate) * up)
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -762,6 +772,8 @@ class Qwen3ForCausalLM(nn.Module):
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", "gate"),
+        "up_proj": ("gate_up_proj", "up"),
     }
 
     def __init__(self, config: Qwen3Config):
@@ -1392,13 +1404,13 @@ def load_weights(model, checkpoint_path):
                 if packed_key in name:
                     param_name = name.replace(packed_key, fused_suffix)
                     param = model.get_parameter(param_name)
-                    # 计算切片: q→前部, k→中部, v→后部 (k/v 同形状)
-                    if shard_id == "q":
+                    # 计算切片: q/gate→前部, k→中部, v/up→后部
+                    if shard_id in ("q", "gate"):
                         offset = 0
                     elif shard_id == "k":
                         offset = param.shape[0] - 2 * tensor.shape[0]  # q_size
-                    else:  # "v"
-                        offset = param.shape[0] - tensor.shape[0]       # q_size + kv_size
+                    else:  # "v" or "up"
+                        offset = param.shape[0] - tensor.shape[0]
                     param.data[offset:offset + tensor.shape[0]] = tensor
                     break
             else:
