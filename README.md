@@ -420,6 +420,8 @@ TEMPERATURE = 0.8     # RL 用高温度鼓励探索
 
 > 注：`generate_naive` 比 `generate_continuous` 慢 **143x**（20.8 vs 2,974 tok/s），差距来自 KV cache（避免重算全历史）和 continuous batching（并行处理多序列）。
 
+> ⚠️ 上述对比中 nano-vllm 的 `enforce_eager=True`（禁用了 CUDA Graph）。公平对比见下方"公平对比与性能剖析"。
+
 ### RTX 4090 48GB — 我们的引擎 vs nano-vllm
 
 64 条随机序列批处理 (input≤512, output=256, Qwen3-0.6B)：
@@ -438,6 +440,81 @@ TEMPERATURE = 0.8     # RL 用高温度鼓励探索
 | naive（无 KV-cache），1 seq | ~3.4 tok/s |
 | varlen batch，4 seqs | ~6.3 tok/s |
 | Continuous Batching + Paged，4 seqs | ~22.8 tok/s |
+
+## 公平对比与性能剖析（双方均开启 CUDA Graph）
+
+### 方法论
+
+用 `torch.cuda.Event` 在 GPU stream 上打时间戳测量各阶段耗时（非 CPU 墙钟），通过 monkey-patch 给关键函数包裹计时器，不改动源码：
+
+```python
+start.record()          # GPU 时间戳 A
+result = orig_fn(...)   # 函数往 GPU 队列发命令（异步）
+end.record()            # GPU 时间戳 B
+torch.cuda.synchronize()
+ms = start.elapsed_time(end)  # 纯 GPU 执行时间
+```
+
+对两个引擎分别 patch：`_prepare_decode` / `_run_decode_graph` / `lm_head`（我们的），`prepare_decode` / `run_model` / `compute_logits` / `sampler`（nano-vllm）。
+
+### 公平对比结果（batch=32, input=256, output=64）
+
+```
+              Ours(tok/s)  Nano(tok/s)  Speedup
+bs=1             180.6       116.3      1.55x  ← 小 batch CPU 优化生效
+bs=2             379.9       141.0      2.69x  ← 小 batch CPU 优化生效
+bs=4             746.1      1061.1      0.70x
+bs=8            1431.9      2046.5      0.70x
+bs=16           2199.7      3292.9      0.67x
+bs=32           3265.8      4672.9      0.70x  ← 大 batch GPU 效率差距
+```
+
+### 瓶颈定位（batch=32 decode 步）
+
+```
+每 decode 步拆解:
+  CUDA Graph replay:  4.91ms  ← 和 nano 的整步(4.73ms)持平
+  + lm_head:          0.39ms
+  + 采样 (top_k=20):  0.68ms
+  + CPU 调度:        ~2-3ms  ← 主要瓶颈!
+  ──────────────────────────
+  总计:              ~8.5ms
+```
+
+**GPU 计算本身不慢，CPU 调度开销是 nano 的 10 倍以上**（`can_append`/`may_append` 逐条 Python 循环、`.item()` 逐 token 同步、`hash_blocks` 逐条调用）。
+
+## 性能优化实战（CPU + GPU 双向优化）
+
+基于 profiling 结果做了两轮优化，各 commit 到 `chunked-prefill` 分支：
+
+### GPU 优化（commit 6a6350d）
+
+| 优化 | 内容 | 效果 |
+|------|------|------|
+| 移除 `.clone()` | CUDA Graph 输出不再复制，lm_head 直接消费 pool 内存 | 每步省一次显存分配+拷贝 |
+| MLP `@torch.compile` | `chunk + silu + mul` 融合为单个 Triton kernel | 28 层 × 2 次 kernel launch → 0 |
+
+结果：CUDA Graph replay **4.91ms → 4.48ms（-8.8%）**，GPU 层面反超 nano-vllm。
+
+### CPU 优化（commit aebbb65）
+
+| 优化 | 内容 | 效果 |
+|------|------|------|
+| `.tolist()` 批量同步 | 32 次 `.item()` GPU→CPU 同步 → 1 次 `.tolist()` | 消除 31 次同步开销 |
+| `all_decode` 快速路径（采样） | 纯 decode 步跳过 `sample_indices` Python 循环 | O(batch) → O(1) |
+| `all_decode` 快速路径（status） | 跳过 `hash_blocks`（decode 不跨 block 立即返回） | 省 32 次函数调用 |
+| `zip` 迭代 token 处理 | 免去每序列的条件判断 | 循环体更紧凑 |
+
+### 经验教训
+
+1. **`@torch.compile` 不是银弹**：RoPE（head_dim=128 的小操作）加 `@torch.compile` 反而倒退——guard 检查开销比内核融合收益还大。中等规模的计算（如 MLP 激活）才值得编译。
+2. **CUDA Graph 内部的 `context_lens + 1` 不能提前**：Graph 捕获的是旧计算图，改动会破坏缓存。这类微优化需要在 Graph 捕获边界内统一考虑。
+3. **profile 的单位是函数而非指令**：monkey-patch 测的是整个函数触发的 GPU 工作量。要更细的粒度需要单独 micro-benchmark（如直接测 `graph.replay()`）。
+4. **小 batch 时 CPU 优化收益最大**（bs=1~2 我们比 nano 快 1.5~2.7x），大 batch 时 GPU 效率主导。
+
+### 已知问题
+
+- **Chunked Prefill bug**（原版遗留）：bs≥24 且 prompt 长度不均匀时，`forward_prefill` 出现 shape 不匹配（`2008 vs 2020`）。与上述优化无关，待修复。
 
 ## 关键设计决策
 
@@ -591,9 +668,12 @@ NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 qwen3_distributed.py
 | P4 | Chunked Prefill | ✅ |
 | P5 | Preemption（LIFO 驱逐） | ✅ |
 | P6 | Prefix Caching（链式 hash + 引用计数） | ✅ |
-| P7 | torch.compile | ❌ |
+| P7 | MLP `@torch.compile`（`chunk+silu+mul` 融合） | ✅ |
 | P8 | CUDA Graph（16 个 bs 图 + graph.replay） | ✅ |
 | P9 | TP-2 分布式推理（Column/Row Parallel + NCCL 通信） | ✅ |
+| P10 | CPU 调度优化（批量 `.tolist()` + `all_decode` 快速路径） | ✅ |
+| P11 | RoPE / QK-Norm + RoPE Triton 融合 | ❌ |
+| P12 | Chunked Prefill shape bug 修复 | ❌ |
 
 ## 参考
 
