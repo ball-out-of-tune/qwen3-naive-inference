@@ -507,14 +507,34 @@ bs=32           3265.8      4672.9      0.70x  ← 大 batch GPU 效率差距
 
 ### 经验教训
 
-1. **`@torch.compile` 不是银弹**：RoPE（head_dim=128 的小操作）加 `@torch.compile` 反而倒退——guard 检查开销比内核融合收益还大。中等规模的计算（如 MLP 激活）才值得编译。
+1. **`@torch.compile` 不是银弹**：RoPE（head_dim=128 的小操作）加 `@torch.compile` 反而倒退——guard 检查开销比内核融合收益还大。中等规模的计算（如 MLP 激活）才值得编译。**但手写 Triton 融合 RoPE 是正解**（见下文 Prefill 优化）。
 2. **CUDA Graph 内部的 `context_lens + 1` 不能提前**：Graph 捕获的是旧计算图，改动会破坏缓存。这类微优化需要在 Graph 捕获边界内统一考虑。
-3. **profile 的单位是函数而非指令**：monkey-patch 测的是整个函数触发的 GPU 工作量。要更细的粒度需要单独 micro-benchmark（如直接测 `graph.replay()`）。
+3. **profile 的单位是函数而非指令**：monkey-patch 测的是整个函数触发的 GPU 工作量。要更细的粒度需要 `torch.profiler`（kernel 级表格）。
 4. **小 batch 时 CPU 优化收益最大**（bs=1~2 我们比 nano 快 1.5~2.7x），大 batch 时 GPU 效率主导。
+5. **容器里跑 torch.compile 要关编译 worker 池**：inductor 的子进程池在 CUDA 初始化后 fork 创建，子进程内 CUDA 调用未定义行为（worker 崩溃 → 池无限重启 → 编译"卡死"）。`torch._inductor.config.compile_threads = 1` 让编译在主进程内完成。冷缓存时必现，热缓存时侥幸绕过，非常隐蔽。
 
-### 已知问题
+### Prefill 优化（commit 2c6924b）
 
-- **Chunked Prefill bug**（原版遗留）：bs≥24 且 prompt 长度不均匀时，`forward_prefill` 出现 shape 不匹配（`2008 vs 2020`）。与上述优化无关，待修复。
+`torch.profiler` kernel 级对比 nano-vllm（8 seqs × 256 tokens, A4500），发现 prefill 慢 1.5x 的三个来源：
+
+| 优化 | 之前 | 之后 |
+|------|------|------|
+| lm_head 只算采样位置 | 对全部 2048 token 算 full-vocab logits（8.2ms） | 先 slice `h[sample_indices]` 再 lm_head（0.5ms） |
+| Triton 融合 RoPE | ~8 个 elementwise + 1 次 cat × 56 组（~12.5ms） | 1 个 kernel/token（1.6ms） |
+| MLP 整体 `@torch.compile` | 只编译 silu，CPU 自耗时 19.3ms | CPU 自耗时 4.8ms |
+
+结果：
+
+```
+prefill (8x256):  51.0ms → 38.1ms  (-25%)   与 nano 差距 1.52x → 1.14x
+decode  (bs=8):   1304  → 1640 tok/s (+26%)  (RoPE 融合对所有步生效)
+```
+
+剩余差距：nano 的 gate_up GEMM 带 silu epilogue 融合（3.1ms）+ 连续 KV 的 flash_attn 比 paged splitkv 快（0.8ms）。留给 `max-autotune` 模式或自定义 GEMM 尝试。
+
+### 已修复问题
+
+- **Chunked Prefill shape bug**（commit 22d2f01）：bs≥16 且总 prompt tokens > 2048 时第二轮混合 batch 必现 `size of tensor a (1920) must match tensor b (1936)`。根因：aebbb65 的 CPU 优化引入 `all_decode` 快速路径时丢失了混合 batch 的 else 分支——采样出的 token 从未 append 到 `seq.token_ids`，但 `kv_len` 已 +1，下一步 `token_ids[kv_len:kv_len+1]` 切出空列表，`positions` 比 `input_ids` 多出 decode seq 数个元素，RoPE 里 q 与 cos/sin 在 dim0 不匹配。修复后 bs=32×3 轮 / bs=24 随机长度 / 重复 prompt 全部通过。
 
 ## 关键设计决策
 
@@ -668,12 +688,13 @@ NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 qwen3_distributed.py
 | P4 | Chunked Prefill | ✅ |
 | P5 | Preemption（LIFO 驱逐） | ✅ |
 | P6 | Prefix Caching（链式 hash + 引用计数） | ✅ |
-| P7 | MLP `@torch.compile`（`chunk+silu+mul` 融合） | ✅ |
-| P8 | CUDA Graph（16 个 bs 图 + graph.replay） | ✅ |
+| P7 | MLP `@torch.compile`（整体 MLP 编译，CPU 开销 19→5ms） | ✅ |
+| P8 | CUDA Graph（8 个 bs 图 + graph.replay） | ✅ |
 | P9 | TP-2 分布式推理（Column/Row Parallel + NCCL 通信） | ✅ |
 | P10 | CPU 调度优化（批量 `.tolist()` + `all_decode` 快速路径） | ✅ |
-| P11 | RoPE / QK-Norm + RoPE Triton 融合 | ❌ |
-| P12 | Chunked Prefill shape bug 修复 | ❌ |
+| P11 | RoPE Triton 融合（手写 kernel，~12.5ms → 1.6ms） | ✅ |
+| P12 | Chunked Prefill shape bug 修复（混合 batch 采样写入） | ✅ |
+| P13 | Prefill lm_head 只算采样位置（8.2ms → 0.5ms） | ✅ |
 
 ## 参考
 
