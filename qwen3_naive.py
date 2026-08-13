@@ -4,6 +4,14 @@ from collections import deque
 import json
 import torch
 import torch.nn as nn
+import torch._inductor.config as _inductor_cfg
+
+# 容器环境坑: inductor 的编译 worker 子进程池通过 fork 创建,
+# fork 发生在 CUDA context 初始化之后 → 子进程内 CUDA 调用未定义行为
+# (实测: worker 崩溃 → 池无限重启 → 主线程永久等待, 表现为编译卡死 + 段错误)。
+# 关闭子进程池, 让 triton 编译在主进程内完成 (vLLM 等生产项目同样处理)。
+_inductor_cfg.compile_threads = 1
+
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 import triton
 import triton.language as tl
