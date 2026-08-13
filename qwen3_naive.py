@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from functools import lru_cache
+from collections import deque
 import json
 import torch
 import torch.nn as nn
@@ -1210,7 +1211,8 @@ class Qwen3ForCausalLM(nn.Module):
             self._capture_decode_graphs()
 
         # 用 prompt_ids_list 创建 Sequence
-        waiting: list[Sequence] = []
+        # deque: pop(0)/insert(0) 都是 O(1), 比 list 的 O(n) 快
+        waiting: deque[Sequence] = deque()
         for pids in prompt_ids_list:
             token_ids = pids[0].tolist()
             waiting.append(Sequence(token_ids, {"temperature": temperature, "max_tokens": max_new_tokens}))
@@ -1239,28 +1241,30 @@ class Qwen3ForCausalLM(nn.Module):
                         running.pop(i)
                         continue
 
-                    if not bm.can_append(seq):
-                        # LIFO preemption: 先踢 running 末尾 (最新加入的),
-                        # 保护已生成很多步的老同志, 实在只剩自己才踢自己
-                        while not bm.can_append(seq):
-                            victim = running[-1]      # 找最新的
-                            victim.status = "WAITING"
-                            bm.deallocate(victim.block_table)
-                            victim.block_table.clear()
-                            victim.kv_len = 0
-                            # preempt 后从 prompt 重新开始, 清除已生成的 token
-                            victim.token_ids = victim.token_ids[:victim.num_prompt_tokens]
-                            victim.response_log_probs.clear()
-                            running.pop()             # 弹出末尾 (LIFO)
-                            waiting.insert(0, victim)
+                    # 内联 can_append: 仅当 kv_len 跨 block 边界时才需要新块
+                    # 常见情况 (kv_len % BLOCK != 0) 跳过两次方法调用
+                    if seq.kv_len % self.BLOCK_SIZE == 0:
+                        if not bm.free:
+                            # LIFO preemption: 先踢 running 末尾 (最新加入的),
+                            # 保护已生成很多步的老同志, 实在只剩自己才踢自己
+                            while not bm.can_append(seq):
+                                victim = running[-1]      # 找最新的
+                                victim.status = "WAITING"
+                                bm.deallocate(victim.block_table)
+                                victim.block_table.clear()
+                                victim.kv_len = 0
+                                # preempt 后从 prompt 重新开始, 清除已生成的 token
+                                victim.token_ids = victim.token_ids[:victim.num_prompt_tokens]
+                                victim.response_log_probs.clear()
+                                running.pop()             # 弹出末尾 (LIFO)
+                                waiting.appendleft(victim)
 
-                            if victim is seq:         # 踢到自己 — 没法了
-                                break
+                                if victim is seq:         # 踢到自己 — 没法了
+                                    break
 
-                        if seq.status == "WAITING":   # seq 被踢了
-                            continue
-
-                    bm.may_append(seq)                   # 正常情况 + LIFO 踢别人后都需要
+                            if seq.status == "WAITING":   # seq 被踢了
+                                continue
+                        bm.may_append(seq)                # 跨边界: 分配新块
                     seq.num_scheduled_tokens = 1
                 else:
                     # ── MID-PREFILL 序列 ──
@@ -1284,7 +1288,7 @@ class Qwen3ForCausalLM(nn.Module):
                         break
                     bm.allocate(seq)
 
-                waiting.pop(0)
+                waiting.popleft()
                 seq.status = "RUNNING"
                 running.append(seq)
 
@@ -1295,7 +1299,7 @@ class Qwen3ForCausalLM(nn.Module):
                     seq.num_scheduled_tokens = budget      # 第一条, 切 chunk
                 else:
                     # 已有其他 seq，留给下一步
-                    waiting.insert(0, seq)
+                    waiting.appendleft(seq)
                     running.pop()
                     break
 
@@ -1429,7 +1433,7 @@ class Qwen3ForCausalLM(nn.Module):
             self._init_cuda_graphs()
             self._capture_decode_graphs()
 
-        waiting: list[Sequence] = []
+        waiting: deque[Sequence] = deque()
         for pids in prompt_ids_list:
             token_ids = pids[0].tolist()
             waiting.append(Sequence(token_ids, {"temperature": temperature, "max_tokens": max_new_tokens}))
@@ -1457,23 +1461,24 @@ class Qwen3ForCausalLM(nn.Module):
                         running.pop(i)
                         continue
 
-                    if not bm.can_append(seq):
-                        while not bm.can_append(seq):
-                            victim = running[-1]
-                            victim.status = "WAITING"
-                            bm.deallocate(victim.block_table)
-                            victim.block_table.clear()
-                            victim.kv_len = 0
-                            victim.token_ids = victim.token_ids[:victim.num_prompt_tokens]
-                            victim.response_log_probs.clear()
-                            running.pop()
-                            waiting.insert(0, victim)
-                            if victim is seq:
-                                break
-                        if seq.status == "WAITING":
-                            continue
-
-                    bm.may_append(seq)
+                    # 内联 can_append: 仅当 kv_len 跨 block 边界时才需要新块
+                    if seq.kv_len % self.BLOCK_SIZE == 0:
+                        if not bm.free:
+                            while not bm.can_append(seq):
+                                victim = running[-1]
+                                victim.status = "WAITING"
+                                bm.deallocate(victim.block_table)
+                                victim.block_table.clear()
+                                victim.kv_len = 0
+                                victim.token_ids = victim.token_ids[:victim.num_prompt_tokens]
+                                victim.response_log_probs.clear()
+                                running.pop()
+                                waiting.appendleft(victim)
+                                if victim is seq:
+                                    break
+                            if seq.status == "WAITING":
+                                continue
+                        bm.may_append(seq)
                     seq.num_scheduled_tokens = 1
                 else:
                     # ── MID-PREFILL ──
@@ -1495,7 +1500,7 @@ class Qwen3ForCausalLM(nn.Module):
                         break
                     bm.allocate(seq)
 
-                waiting.pop(0)
+                waiting.popleft()
                 seq.status = "RUNNING"
                 running.append(seq)
 
@@ -1505,7 +1510,7 @@ class Qwen3ForCausalLM(nn.Module):
                 elif len(all_scheduled) == 0:
                     seq.num_scheduled_tokens = budget
                 else:
-                    waiting.insert(0, seq)
+                    waiting.appendleft(seq)
                     running.pop()
                     break
 
