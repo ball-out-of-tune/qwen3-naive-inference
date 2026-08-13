@@ -41,6 +41,45 @@ def store_kvcache(key, value, k_cache, v_cache, slot_mapping):
                                  k_cache, v_cache, slot_mapping, D)
 
 
+@triton.jit
+def _apply_rope_kernel(x_ptr, cache_ptr, pos_ptr, out_ptr,
+                       H: tl.constexpr, D: tl.constexpr, ODT: tl.constexpr):
+    """融合 RoPE: 每个 program 处理一个 token 的 [H, D] 块。
+
+    替代原 eager 实现 (~8 个 elementwise + 1 次 cat / 每 head 组),
+    HF/Qwen3 布局: 输出前半 = x1*cos - x2*sin, 后半 = x2*cos + x1*sin
+    (x1 = 前 half 个元素, x2 = 后 half 个元素, 配对 j ↔ j+half)。
+    """
+    i = tl.program_id(0)
+    pos = tl.load(pos_ptr + i).to(tl.int32)
+    half: tl.constexpr = D // 2
+    row = pos * D
+    c = tl.load(cache_ptr + row + tl.arange(0, half)).to(tl.float32)   # [half]
+    s = tl.load(cache_ptr + row + half + tl.arange(0, half)).to(tl.float32)
+    base = i * H * D
+    for h in tl.static_range(H):
+        off = base + h * D
+        x1 = tl.load(x_ptr + off + tl.arange(0, half)).to(tl.float32)
+        x2 = tl.load(x_ptr + off + half + tl.arange(0, half)).to(tl.float32)
+        o0 = x1 * c - x2 * s
+        o1 = x2 * c + x1 * s
+        tl.store(out_ptr + off + tl.arange(0, half), o0.to(ODT))
+        tl.store(out_ptr + off + half + tl.arange(0, half), o1.to(ODT))
+
+
+_TL_DTYPES = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16,
+              torch.float32: tl.float32}
+
+
+def apply_rope_kernel(x, positions, cos_sin_cache, out_dtype):
+    """RoPE 融合入口: x [N, heads, dim] → 旋转后的同形状 tensor。"""
+    N, H, D = x.shape
+    out = torch.empty_like(x, dtype=out_dtype)
+    _apply_rope_kernel[(N,)](x, cos_sin_cache, positions, out,
+                             H=H, D=D, ODT=_TL_DTYPES[out_dtype])
+    return out
+
+
 @dataclass
 class VarlenContext:
     cu_seqlens_q: torch.Tensor
@@ -351,30 +390,19 @@ class RotaryEmbedding(nn.Module):
         orig_dtype_q = q.dtype
         orig_dtype_k = k.dtype
 
-        # cos/sin: [seq_len, head_dim//2] or [total_tokens, head_dim//2] each
-        cos_sin = self.cos_sin_cache[positions]            # [N, head_dim]
-        cos, sin = cos_sin.chunk(2, dim=-1)                # each [N, head_dim//2]
-
-        # 根据输入维度调整广播形状
+        # 展平成 [N, heads, dim] (4-D 的 batch 维并入 N, positions 相应 repeat)
         if q.dim() == 4:
-            # [batch, seq, heads, dim] → cos/sin: [1, seq, 1, head_dim//2]
-            cos = cos.unsqueeze(0).unsqueeze(2)
-            sin = sin.unsqueeze(0).unsqueeze(2)
+            B, S = q.shape[0], q.shape[1]
+            q_flat = q.view(B * S, *q.shape[2:])
+            k_flat = k.view(B * S, *k.shape[2:])
+            pos = positions.view(1, -1).expand(B, -1).reshape(B * S)
         else:
-            # varlen: [tokens, heads, dim] → cos/sin: [tokens, 1, head_dim//2]
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
+            q_flat, k_flat = q, k
+            pos = positions
 
-        def rotate(x, x_orig_dtype):
-            x_f32 = x.float()
-            x1, x2 = x_f32.chunk(2, dim=-1)        # 前半/后半配对，和 HF 一致
-            x_new0 = x1 * cos - x2 * sin
-            x_new1 = x2 * cos + x1 * sin
-            return torch.cat([x_new0, x_new1], dim=-1).to(x_orig_dtype)
-
-        q = rotate(q, orig_dtype_q)
-        k = rotate(k, orig_dtype_k)
-        return q, k
+        q_out = apply_rope_kernel(q_flat, pos, self.cos_sin_cache, orig_dtype_q)
+        k_out = apply_rope_kernel(k_flat, pos, self.cos_sin_cache, orig_dtype_k)
+        return q_out.view_as(q), k_out.view_as(k)
 
 @lru_cache(8)
 def get_rope(head_dim: int, max_position: int, rope_theta: float):
@@ -665,14 +693,12 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     @torch.compile
-    def _silu_and_mul(self, gate_up):
-        """将 chunk + silu + mul 融合为一个编译 kernel, 减少 kernel launch 开销"""
-        gate, up = gate_up.chunk(2, dim=-1)
-        return torch.nn.functional.silu(gate) * up
-
     def forward(self, x):
+        """整个 MLP 编译: inductor 把 silu 融合进 gate_up GEMM 的 epilogue
+        (nano-vllm 同款优化), 并把 chunk/mul/down_proj 一起优化调度。"""
         gate_up = self.gate_up_proj(x)
-        hidden = self._silu_and_mul(gate_up)
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = torch.nn.functional.silu(gate) * up
         return self.down_proj(hidden)
 
 
@@ -1322,6 +1348,21 @@ class Qwen3ForCausalLM(nn.Module):
             # ============================================================
             all_decode = all(s.num_scheduled_tokens == 1 for s in all_scheduled)
 
+            # ★ 采样位置在 lm_head 之前算好: prefill 只对被采样位置
+            # (每 seq 最后一个新 token) 算 logits, 而不是对全部 2048 token
+            # 算 full-vocab logits (8ms → <1ms)
+            if all_decode:
+                n_scheduled = len(all_scheduled)
+                sample_indices = list(range(n_scheduled))
+            else:
+                sample_indices = []
+                offset = 0
+                for seq in all_scheduled:
+                    if (seq.num_scheduled_tokens == 1 or
+                            seq.kv_len + seq.num_scheduled_tokens >= seq.num_prompt_tokens):
+                        sample_indices.append(offset + seq.num_scheduled_tokens - 1)
+                    offset += seq.num_scheduled_tokens
+
             if all_decode:
                 # decode-only: 优先 CUDA Graph, 回退到 eager
                 input_ids, pos, ctx_lens, block_tables, slot_mapping = self._prepare_decode(all_scheduled)
@@ -1341,7 +1382,11 @@ class Qwen3ForCausalLM(nn.Module):
                 input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables = self._prepare_step(all_scheduled)
                 h = self.model.forward_prefill(input_ids, pos, cu_q, cu_k, m_q, m_k, blk_map, block_tables)
 
-            logits = self.lm_head(h)
+            if sample_indices:
+                # 只对采样位置做 full-vocab lm_head (decode: 全部位置)
+                logits = self.lm_head(h[sample_indices])
+            else:
+                logits = None   # 全是 mid-prefill, 不需要 logits
 
             # ============================================================
             # Step 4: 更新 kv_len + hash blocks
@@ -1357,27 +1402,15 @@ class Qwen3ForCausalLM(nn.Module):
 
             # ============================================================
             # Step 5: 条件采样 — 仅 prefill 完成 或 decode
+            # (sample_indices 已在 Step 3 算好, logits 已只含采样位置)
             # ============================================================
-            n_scheduled = len(all_scheduled)
-            # 快速路径: 纯 decode step, 所有序列都需要采样
-            if all_decode:
-                last_logits = logits[:n_scheduled].float()
-                sample_indices = list(range(n_scheduled))
-            else:
-                sample_indices = []
-                offset = 0
+            if logits is None:
+                # 所有 seq 都是 mid-prefill, 不采样
                 for seq in all_scheduled:
-                    if seq.num_scheduled_tokens == 1 or seq.kv_len >= seq.num_prompt_tokens:
-                        sample_indices.append(offset + seq.num_scheduled_tokens - 1)
-                    offset += seq.num_scheduled_tokens
+                    seq.num_scheduled_tokens = 0
+                continue
 
-                if sample_indices:
-                    last_logits = logits[sample_indices].float()
-                else:
-                    # 所有 seq 都是 mid-prefill, 不采样
-                    for seq in all_scheduled:
-                        seq.num_scheduled_tokens = 0
-                    continue
+            last_logits = logits.float()
 
             last_logits = last_logits / temperature
             if top_k is not None:
