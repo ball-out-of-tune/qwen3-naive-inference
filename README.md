@@ -469,6 +469,26 @@ bs=16           2199.7      3292.9      0.67x
 bs=32           3265.8      4672.9      0.70x  ← 大 batch GPU 效率差距
 ```
 
+### 最终对比（全部优化后，2026-08-13 同场重测，input=128, output=64, 双方 CUDA Graph）
+
+```
+              Ours(tok/s)  Nano(tok/s)  Speedup
+bs=1             232.9       255.9      0.91x
+bs=2             444.7       464.9      0.96x
+bs=4             873.3       900.9      0.97x
+bs=8            1643.8      1715.2      0.96x
+bs=16           2933.0      3147.5      0.93x
+bs=32           4108.3      4999.7      0.82x  ← 剩余差距: 每步 CPU ~1.4ms (nano ~0.2ms)
+
+prefill 8x256+16 decode:
+  Ours 112.5ms | Nano 103.4ms | 0.92x
+  (仅 prefill 一步: 38.1ms vs 33.5ms = 1.14x, 差距 = GEMM epilogue 融合 3.1ms
+   + paged splitkv flash-attn 0.8ms)
+
+注: 我们采样带 top_k=20, nano 的 SamplingParams 不支持 top_k (无截断,
+理论上略占便宜; topk 实测每步 ~44μs, 影响 <1%)。
+```
+
 ### 瓶颈定位（batch=32 decode 步）
 
 ```
