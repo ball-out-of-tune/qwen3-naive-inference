@@ -1402,6 +1402,27 @@ class Qwen3ForCausalLM(nn.Module):
                         running.remove(seq)
 
                     seq.num_scheduled_tokens = 0   # reset
+            else:
+                # 混合 batch: 按 sample_indices 的顺序把采样 token 分配回对应 seq
+                # (decode 或本轮 prefill 完成的 seq 才被采样, mid-prefill 不采样)
+                sampled = (s for s in all_scheduled
+                           if s.num_scheduled_tokens == 1 or s.kv_len >= s.num_prompt_tokens)
+                for seq, (token_id,) in zip(sampled, token_list):
+                    seq.append_token(token_id)
+
+                    if eos_token_ids is not None and token_id in eos_token_ids:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.remove(seq)
+                    elif seq.num_completion_tokens >= seq.max_tokens:
+                        seq.status = "FINISHED"
+                        bm.deallocate(seq.block_table)
+                        seq.block_table.clear()
+                        running.remove(seq)
+
+                for seq in all_scheduled:
+                    seq.num_scheduled_tokens = 0   # reset
 
         # 返回结果
         results = [(s.token_ids, s.token_ids[s.num_prompt_tokens:]) for s in all_seqs]
